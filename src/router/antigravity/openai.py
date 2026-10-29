@@ -311,11 +311,12 @@ async def chat_completions(
             and choice is not None and choice != "auto"
             and not (isinstance(choice, dict) and choice.get("type") == "auto")):
         notes.append("tool_choice(anti_truncation_auto)")
-    response_headers = {"x-agy-ignored-params": ",".join(notes)} if notes else {}
 
     # 对于抗截断模型的非流式请求，给出警告
     if use_anti_truncation and not is_streaming:
+        notes.append("anti_truncation(non_stream)")
         log.warning("抗截断功能仅在流式传输时有效，非流式请求将忽略此设置")
+    response_headers = {"x-agy-ignored-params": ",".join(notes)} if notes else {}
 
     # 更新模型名为真实模型名
     normalized_dict["model"] = real_model

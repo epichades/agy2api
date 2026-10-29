@@ -142,6 +142,8 @@ async def create_response(request: Request, _token: str = Depends(authenticate_b
     if (conv.stream and conv.use_anti_truncation and conv.is_claude
             and body.get("tool_choice") not in (None, "auto")):
         conv.note("tool_choice(anti_truncation_auto)")
+    if conv.use_anti_truncation and not conv.stream:
+        conv.note("anti_truncation(non_stream)")
     has_schema = "responseSchema" in (api_request["request"].get("generationConfig") or {})
     state: Dict[str, Any] = {"account": None}
     session_key = pck_session_key(conv.real_model, conv.prompt_cache_key)
@@ -246,8 +248,6 @@ async def create_response(request: Request, _token: str = Depends(authenticate_b
     else:
         upstream_iter = upstream
         initial_events = [first]
-        if conv.use_anti_truncation:
-            conv.note("anti_truncation(non_stream)")
 
     mapper = ResponsesMapper(conv, account_ref=lambda: state["account"], warnings_ref=lambda: notes)
     start = mapper.start_events()

@@ -73,8 +73,9 @@ router = APIRouter()
 
 # ==================== API 路由 ====================
 
-def _native_error(status: int, message: str, error_type: str = "api_error") -> JSONResponse:
-    return JSONResponse(status_code=status, content={"type": "error", "error": {"type": error_type, "message": message}})
+def _native_error(status: int, message: str, error_type: str = "api_error", headers=None) -> JSONResponse:
+    return JSONResponse(status_code=status, headers=headers,
+                        content={"type": "error", "error": {"type": error_type, "message": message}})
 
 
 def _upstream_error(response: Response) -> JSONResponse:
@@ -297,6 +298,8 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
     if (use_anti_truncation and "claude" in real_model.lower()
             and choice is not None and choice.get("type") != "auto"):
         notes.append("tool_choice(anti_truncation_auto)")
+    if is_anti_truncation_model(claude_request.model) and not claude_request.stream:
+        notes.append("anti_truncation(non_stream)")
     headers = {"x-agy-ignored-params": ",".join(dict.fromkeys(notes))} if notes else {}
     selected = {"account": None}
 
@@ -316,9 +319,6 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
     def stream(payload):
         return stream_request(body=payload, native=False, log_ctx=log_ctx, on_credential=on_credential,
                               required_account_hash=required_account_hash)
-    if is_anti_truncation_model(claude_request.model) and not claude_request.stream:
-        notes.append("anti_truncation(non_stream)")
-        headers["x-agy-ignored-params"] = ",".join(dict.fromkeys(notes))
     if use_anti_truncation:
         api_request = apply_anti_truncation(api_request)
     iterator = stream(api_request)
@@ -326,14 +326,14 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
         first = await read_first_async_item(iterator)
     except StopAsyncIteration:
         await close_async_iterator(iterator)
-        return _native_error(502, "Upstream returned no data")
+        return _native_error(502, "Upstream returned no data", headers=headers)
     except HTTPException as error:
         await close_async_iterator(iterator)
-        return _native_error(error.status_code, str(error.detail), "invalid_request_error")
+        return _native_error(error.status_code, str(error.detail), "invalid_request_error", headers=headers)
     except Exception as error:
         await close_async_iterator(iterator)
         log.error(f"[ANTHROPIC] Upstream request failed: {type(error).__name__}")
-        return _native_error(502, "Upstream request failed")
+        return _native_error(502, "Upstream request failed", headers=headers)
     if isinstance(first, Response):
         await close_async_iterator(iterator)
         response = _upstream_error(first)

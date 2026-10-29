@@ -6,12 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 import httpx
 import pytest
 
 
 NOTE = "tool_choice(anti_truncation_auto)"
+NON_STREAM_NOTE = "anti_truncation(non_stream)"
 TOOL = "synthetic_private_tool_name"
 CLAUDE = "claude-opus-5-5-low"
 PATHS = {"chat": "/v1/chat/completions", "responses": "/v1/responses", "native": "/v1/messages"}
@@ -46,13 +47,19 @@ async def gateway(monkeypatch):
     from src.router.antigravity import anthropic, openai, responses
 
     monkeypatch.setenv("RESPONSES_STATE_KEY", Fernet.generate_key().decode())
-    state = SimpleNamespace(calls=[], reject=False)
+    state = SimpleNamespace(calls=[], reject=False, failure_mode=None)
     app = FastAPI()
     output = {"candidates": [{"content": {"parts": [{"text": "Synthetic answer"}]}, "finishReason": "STOP"}],
               "usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}}
 
     async def upstream(**kwargs):
         state.calls.append(copy.deepcopy(kwargs["body"]))
+        if state.failure_mode == "empty":
+            return
+        if state.failure_mode == "exception":
+            raise RuntimeError("synthetic upstream failure")
+        if state.failure_mode == "http_exception":
+            raise HTTPException(status_code=409, detail="synthetic unavailable owner")
         if state.reject:
             yield Response(status_code=400, media_type="text/event-stream", content=json.dumps({
                 "error": {"code": 400, "message": "Synthetic tool choice unsupported", "status": "INVALID_ARGUMENT"},
@@ -67,6 +74,10 @@ async def gateway(monkeypatch):
 
     async def non_stream(**kwargs):
         state.calls.append(copy.deepcopy(kwargs["body"]))
+        if state.reject:
+            return Response(status_code=400, media_type="text/event-stream", content=json.dumps({
+                "error": {"code": 400, "message": "Synthetic tool choice unsupported", "status": "INVALID_ARGUMENT"},
+            }))
         return Response(content=json.dumps(output), media_type="application/json")
 
     for route in (openai, responses, anthropic):
@@ -129,6 +140,10 @@ async def test_tool_choice_warning_is_limited_to_active_claude_override(gateway,
     assert NOTE not in response.headers.get("x-agy-ignored-params", "")
     assert NOTE not in response.text
     assert len(state.calls) == 1
+    if case == "non_stream":
+        assert NON_STREAM_NOTE in response.headers.get("x-agy-ignored-params", "").split(",")
+        if protocol != "native":
+            assert NON_STREAM_NOTE in response.json().get("x_agy_ignored_params", [])
     if case in ("non_stream", "regular", "gemini"):
         assert state.calls[0]["request"]["toolConfig"]["functionCallingConfig"]["mode"] == "ANY"
 
@@ -161,3 +176,55 @@ async def test_native_auto_only_keeps_existing_parallel_tool_warning(gateway):
     assert "tool_choice.disable_parallel_tool_use" in notes
     assert NOTE not in notes
     assert state.calls[0]["request"]["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
+
+
+@pytest.mark.parametrize("protocol", PATHS)
+@pytest.mark.parametrize("choice", ["required", "named"])
+@pytest.mark.asyncio
+async def test_non_stream_anti_prefix_warning_survives_predata_rejection(gateway, protocol, choice):
+    client, state = gateway
+    state.reject = True
+    response = await client.post(PATHS[protocol], json=request_payload(protocol, choice, streaming=False))
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    notes = response.headers.get("x-agy-ignored-params", "").split(",")
+    assert notes.count(NON_STREAM_NOTE) == 1 and NOTE not in notes
+    assert TOOL not in response.headers["x-agy-ignored-params"]
+    if protocol == "chat":
+        assert NON_STREAM_NOTE in response.json()["x_agy_ignored_params"]
+    assert len(state.calls) == 1
+    upstream = state.calls[0]
+    assert upstream["model"] == CLAUDE
+    config = upstream["request"]["toolConfig"]["functionCallingConfig"]
+    assert config["mode"] == "ANY"
+    if choice == "named":
+        assert config["allowedFunctionNames"] == [TOOL]
+    assert "emit_answer" not in json.dumps(upstream)
+    assert NON_STREAM_NOTE not in json.dumps(upstream)
+
+
+@pytest.mark.parametrize("protocol", PATHS)
+@pytest.mark.parametrize("reject", [False, True])
+@pytest.mark.asyncio
+async def test_regular_non_stream_requests_do_not_report_anti_truncation(gateway, protocol, reject):
+    client, state = gateway
+    state.reject = reject
+    response = await client.post(PATHS[protocol], json=request_payload(protocol, anti=False, streaming=False))
+    assert response.status_code == (400 if reject else 200)
+    assert NON_STREAM_NOTE not in response.headers.get("x-agy-ignored-params", "")
+    assert NON_STREAM_NOTE not in response.text and NOTE not in response.text
+
+
+@pytest.mark.parametrize("protocol", ["responses", "native"])
+@pytest.mark.parametrize("failure_mode", ["empty", "exception", "http_exception"])
+@pytest.mark.asyncio
+async def test_non_stream_anti_prefix_warning_survives_prefetch_failure(gateway, protocol, failure_mode):
+    client, state = gateway
+    state.failure_mode = failure_mode
+    response = await client.post(PATHS[protocol], json=request_payload(protocol, streaming=False))
+    expected = 409 if protocol == "native" and failure_mode == "http_exception" else 502
+    assert response.status_code == expected
+    assert response.headers["content-type"] == "application/json"
+    notes = response.headers.get("x-agy-ignored-params", "").split(",")
+    assert notes.count(NON_STREAM_NOTE) == 1 and NOTE not in notes
+    assert len(state.calls) == 1

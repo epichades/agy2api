@@ -80,14 +80,16 @@ async def gateway(monkeypatch):
     from src.api import antigravity as api
     from src.converter import antigravity_fix
     from src.router.antigravity import openai as route
+    from src.router.antigravity import responses as responses_route
 
     state = SimpleNamespace(requests=[], attempts=[_wire([{"text": "SYNTHETIC_OK"}])])
 
     def upstream(request):
         state.requests.append(json.loads(request.content))
         assert len(state.requests) <= len(state.attempts), "unexpected duplicate upstream request"
-        return httpx.Response(200, headers={"content-type": "text/event-stream"},
-                              content=state.attempts[len(state.requests) - 1])
+        content = state.attempts[len(state.requests) - 1]
+        response_args = {"stream": content} if isinstance(content, httpx.AsyncByteStream) else {"content": content}
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, **response_args)
 
     @asynccontextmanager
     async def streaming_client(**kwargs):
@@ -107,11 +109,14 @@ async def gateway(monkeypatch):
     monkeypatch.setattr(api, "_record_request_body_detail", AsyncMock(return_value=""))
     monkeypatch.setattr(antigravity_fix, "get_return_thoughts_to_frontend", AsyncMock(return_value=True))
     monkeypatch.setattr(route, "get_anti_truncation_max_attempts", AsyncMock(return_value=2))
+    monkeypatch.setattr(responses_route, "get_anti_truncation_max_attempts", AsyncMock(return_value=2))
     # Keep the real converter, normalizer, shared request wrapper and HTTPX line
     # transport. Only account storage and the external HTTP peer are synthetic.
     app = FastAPI()
     app.include_router(route.router)
+    app.include_router(responses_route.router)
     app.dependency_overrides[route.authenticate_bearer] = lambda: "synthetic-auth"
+    app.dependency_overrides[responses_route.authenticate_bearer] = lambda: "synthetic-auth"
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://synthetic.invalid") as client:
         yield client, state
 
@@ -200,3 +205,133 @@ async def test_claude_auto_real_tool_is_delivered_once_without_continuation(gate
     assert len(calls) == 1 and calls[0]["function"]["name"] == "real_tool"
     assert json.loads(calls[0]["function"]["arguments"]) == {"value": "true"}
     assert chunks[-1]["usage"]["total_tokens"] == 5
+
+
+def _data(value):
+    return ("data: " + json.dumps(value) + "\n\n").encode()
+
+
+def _tool_frame(finish=None):
+    candidate = {"content": {"parts": [{"functionCall": {
+        "name": "real_tool", "id": "synthetic-call", "args": {"value": "true"},
+    }}]}, "index": 0}
+    if finish is not None:
+        candidate["finishReason"] = finish
+    return _data({"candidates": [candidate]})
+
+
+async def _call_real_tool(client, protocol):
+    function = {"name": "real_tool", "parameters": {
+        "type": "object", "properties": {"value": {"type": "string"}},
+    }}
+    if protocol == "chat":
+        return await _call(client, tools=[{"type": "function", "function": function}], tool_choice="required")
+    return await client.post("/v1/responses", json={
+        "model": "抗截断-" + CLAUDE, "input": "synthetic request", "stream": True,
+        "tools": [{"type": "function", **function}], "tool_choice": "required", "max_output_tokens": 1024,
+    })
+
+
+def _real_tool_events(response, protocol):
+    assert response.status_code == 200, response.text
+    events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: {")]
+    if protocol == "chat":
+        calls = [call for event in events for choice in event.get("choices", [])
+                 for call in choice.get("delta", {}).get("tool_calls", [])]
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "real_tool"
+        assert json.loads(calls[0]["function"]["arguments"]) == {"value": "true"}
+    else:
+        calls = [event["item"] for event in events if event["type"] == "response.output_item.added"
+                 and event["item"]["type"] == "function_call"]
+        assert len(calls) == 1 and calls[0]["name"] == "real_tool"
+    return events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("separate_finish", [False, True])
+async def test_real_tool_finish_frame_and_late_usage_survive_once(gateway, protocol, separate_finish):
+    client, state = gateway
+    wire = _tool_frame(None if separate_finish else "STOP")
+    if separate_finish:
+        wire += _data({"candidates": [{"index": 0, "finishReason": "STOP"}]})
+    wire += _data({"usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}})
+    state.attempts = [wire + b"data: [DONE]\n\n"]
+    response = await _call_real_tool(client, protocol)
+    events = _real_tool_events(response, protocol)
+    assert len(state.requests) == 1
+    if protocol == "chat":
+        finishes = [choice["finish_reason"] for event in events for choice in event.get("choices", [])
+                    if choice.get("finish_reason")]
+        assert finishes == ["tool_calls"]
+        assert all("error" not in event for event in events)
+        assert events[-1]["choices"] == [] and events[-1]["usage"]["total_tokens"] == 5
+        assert response.text.count("data: [DONE]") == 1
+    else:
+        assert [event["type"] for event in events if event["type"] in ("response.completed", "response.failed")] == ["response.completed"]
+        assert events[-1]["response"]["status"] == "completed"
+        assert events[-1]["response"]["usage"]["total_tokens"] == 5
+
+
+class _ToolThenTransportFailure(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield _tool_frame()
+        raise httpx.ReadError("synthetic transport failure")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("failure", ["missing_finish", "malformed_json", "transport"])
+async def test_real_tool_failure_never_invents_finish_or_replays(gateway, protocol, failure):
+    client, state = gateway
+    if failure == "transport":
+        wire = _ToolThenTransportFailure()
+    else:
+        wire = _tool_frame()
+        if failure == "malformed_json":
+            wire += b"data: {broken}\n\n"
+            wire += _data({"candidates": [{"index": 0, "finishReason": "STOP"}]})
+        wire += b"data: [DONE]\n\n"
+    state.attempts = [wire]
+    response = await _call_real_tool(client, protocol)
+    events = _real_tool_events(response, protocol)
+    assert len(state.requests) == 1
+    if protocol == "chat":
+        assert any(event.get("error", {}).get("code") == "upstream_stream_error" for event in events)
+        assert not any(choice.get("finish_reason") for event in events for choice in event.get("choices", []))
+        assert response.text.count("data: [DONE]") == 1
+    else:
+        assert events[-1]["type"] == "response.failed"
+        assert events[-1]["response"]["status"] == "failed"
+        assert not any(event["type"] == "response.completed" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("has_finish", [False, True])
+async def test_real_tool_does_not_bypass_later_synthetic_tool_conversion(gateway, protocol, has_finish):
+    client, state = gateway
+    wire = _tool_frame() + _data({"candidates": [{"content": {"parts": [{"functionCall": {
+        "name": "emit_answer", "args": {"content": "synthetic final"},
+    }}]}}]})
+    if has_finish:
+        wire += _data({"candidates": [{"index": 0, "finishReason": "STOP"}]})
+    wire += _data({"usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}})
+    state.attempts = [wire + b"data: [DONE]\n\n"]
+    response = await _call_real_tool(client, protocol)
+    events = _real_tool_events(response, protocol)
+    assert len(state.requests) == 1
+    assert '"emit_answer"' not in response.text
+    if protocol == "chat":
+        assert any("error" in event for event in events) is not has_finish
+        text = "".join(choice.get("delta", {}).get("content", "")
+                       for event in events for choice in event.get("choices", []))
+        assert text == "synthetic final"
+        finishes = [choice["finish_reason"] for event in events for choice in event.get("choices", [])
+                    if choice.get("finish_reason")]
+        assert finishes == (["tool_calls"] if has_finish else [])
+    else:
+        assert events[-1]["type"] == ("response.completed" if has_finish else "response.failed")
+        messages = [item for item in events[-1]["response"]["output"] if item["type"] == "message"]
+        assert messages[0]["content"][0]["text"] == "synthetic final"

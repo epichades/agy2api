@@ -602,6 +602,10 @@ class AntiTruncationStreamProcessor:
 
                         # 检查是否是 [DONE] 标记
                         if payload_str.strip() == "[DONE]":
+                            if real_tool_forwarded:
+                                # A later synthetic tool does not authorize a
+                                # fabricated finish or another real-tool attempt.
+                                break
                             if found_synthetic:
                                 if (
                                     last_finish_reason in TRUNCATION_FINISH_REASONS
@@ -724,6 +728,18 @@ class AntiTruncationStreamProcessor:
                             if chunk_finish:
                                 last_finish_reason = chunk_finish
                                 # 原样透传的 chunk 自带 finishReason
+                                finish_reason_forwarded = True
+                            yield line
+
+                        elif real_tool_forwarded:
+                            # A real tool call makes this attempt non-replayable.
+                            # Its finish event may arrive in a later frame; do not
+                            # withhold it in the plain-text continuation branch.
+                            # Forward the original frame (including candidate
+                            # indices/metadata), followed by any late usage.
+                            chunk_finish = self._get_finish_reason(data)
+                            if chunk_finish:
+                                last_finish_reason = chunk_finish
                                 finish_reason_forwarded = True
                             yield line
 
