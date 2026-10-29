@@ -458,21 +458,17 @@ class ResponsesMapper:
         except UnicodeError:
             self.fail("Invalid upstream SSE UTF-8")
             return []
+        # native=False uses httpx.aiter_lines(): each str is a complete line,
+        # with its delimiter removed (including the empty event separator).
+        # Bytes remain arbitrary transport fragments and must not gain a newline.
+        split_line = isinstance(line, str) and "\n" not in text
+        if split_line:
+            text += "\n"
         if len(self._line_buffer) + len(text) > 8 * 1024 * 1024:
             self.fail("Upstream SSE frame exceeds supported size")
             return []
-        # The shared upstream also yields already-split data lines. Flush an
-        # unfinished previous line explicitly before accepting another data line.
-        if self._line_buffer and text.startswith("data:"):
-            self._event_data.append(self._line_buffer[5:].lstrip(" ") if self._line_buffer.startswith("data:") else self._line_buffer)
-            self._line_buffer = ""
-            prior = self._consume_event()
-        else:
-            prior = []
-        if self.error:
-            return prior
         self._line_buffer += text
-        evs: List[Dict[str, Any]] = prior
+        evs: List[Dict[str, Any]] = []
         while "\n" in self._line_buffer:
             raw, self._line_buffer = self._line_buffer.split("\n", 1)
             raw = raw.rstrip("\r")
@@ -483,6 +479,17 @@ class ResponsesMapper:
             # event:, id:, retry: and comment lines do not carry model data.
         if self.error:
             return evs
+        # Some callers supply only already-split data lines without empty
+        # separators. Preserve that contract once the complete JSON is present;
+        # partial multi-line JSON stays pending until later data lines arrive.
+        if split_line and self._event_data and not self._line_buffer:
+            payload = "\n".join(self._event_data)
+            try:
+                complete = payload == "[DONE]" or isinstance(json.loads(payload), dict)
+            except (ValueError, TypeError):
+                complete = False
+            if complete:
+                evs += self._consume_event()
         # Complete single-line JSON is safe to accept immediately; an incomplete
         # JSON prefix remains buffered until the next chunk or finish().
         if self._line_buffer.startswith("data:") and not self._event_data:

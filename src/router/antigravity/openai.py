@@ -127,7 +127,7 @@ def _prepare_chat_request(request):
 
 
 class _SSEDecoder:
-    """Incremental UTF-8 and SSE framing; HTTP chunk boundaries are arbitrary."""
+    """Decode raw byte fragments or the shared transport's newline-free str lines."""
 
     def __init__(self):
         self.decoder = codecs.getincrementaldecoder("utf-8")("strict")
@@ -135,7 +135,13 @@ class _SSEDecoder:
         self.data = []
 
     def feed(self, chunk=b"", final=False):
-        text = self.decoder.decode(chunk, final=final) if isinstance(chunk, bytes) else chunk
+        if isinstance(chunk, str):
+            # stream_request(native=False) uses httpx.aiter_lines(), which
+            # removes line terminators, including the empty event separator.
+            # Anti-truncation may also emit complete frames; keep those intact.
+            text = chunk if "\n" in chunk else chunk + "\n"
+        else:
+            text = self.decoder.decode(chunk, final=final)
         self.buffer += text
         # Bound a malformed/unclosed event, without buffering the whole response.
         if len(self.buffer) + sum(map(len, self.data)) > 16 * 1024 * 1024:

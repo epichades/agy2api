@@ -1,5 +1,6 @@
 """SDK request compatibility and complete Chat SSE contracts, without live accounts."""
 import json
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -168,6 +169,87 @@ async def test_sse_split_utf8_and_multiple_events_preserve_text(gateway):
     text = "".join(choice["delta"].get("content", "") for chunk in events(response) for choice in chunk["choices"])
     assert text == "中文 …  "
     assert events(response)[-1]["choices"] == []
+    assert state.closed
+
+
+@pytest.mark.parametrize("anti_truncation", [False, True])
+@pytest.mark.parametrize("include_usage", [False, True])
+@pytest.mark.parametrize("control_fields", [False, True])
+@pytest.mark.asyncio
+async def test_chat_uses_real_httpx_line_transport(gateway, monkeypatch, anti_truncation, include_usage, control_fields):
+    """Exercise the producer, not a mock returning already-framed SSE bytes."""
+    from src import httpx_client
+    from src.router.antigravity import openai as route
+
+    client, state = gateway
+    content = {"parts": [{"text": "中文 …  "}]}
+    if anti_truncation:
+        content = {"parts": [{"functionCall": {"name": "emit_answer", "args": {"content": "中文 …  "}}}]}
+    wire = b": heartbeat\r\n\r\nid: synthetic\r\nevent: message\r\nretry: 1000\r\n" if control_fields else b""
+    wire += event({"response": {"candidates": [{"content": content}]}})
+    wire += event({"candidates": [{"finishReason": "STOP"}]})
+    wire += event({"usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}})
+    wire += b"data: [DONE]\r\n\r\n"
+    observed = []
+
+    @asynccontextmanager
+    async def transport_client(**kwargs):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=wire, headers={"content-type": "text/event-stream"})
+        )) as upstream:
+            yield upstream
+
+    async def stream(**kwargs):
+        state.calls.append(kwargs["body"])
+        source = httpx_client.stream_post_async(
+            "https://synthetic.invalid/stream", kwargs["body"], native=kwargs["native"])
+        try:
+            async for chunk in source:
+                observed.append(chunk)
+                yield chunk
+        finally:
+            await source.aclose()
+            state.closed = True
+
+    monkeypatch.setattr(httpx_client, "get_streaming_client", transport_client)
+    monkeypatch.setattr(route, "stream_request", stream)
+    response = await client.post("/v1/chat/completions", json=payload(
+        model=("抗截断-" if anti_truncation else "") + MODEL, stream=True,
+        stream_options={"include_usage": include_usage}, metadata={"private": PRIVATE_VALUE},
+        parallel_tool_calls=False, reasoning_effort="low", sdk_extension=PRIVATE_VALUE,
+    ))
+    assert response.status_code == 200, response.text
+    chunks = events(response)
+    assert not any("error" in chunk for chunk in chunks)
+    assert "".join(choice["delta"].get("content", "") for chunk in chunks for choice in chunk["choices"]) == "中文 …  "
+    assert any(choice["finish_reason"] for chunk in chunks for choice in chunk["choices"])
+    assert response.text.endswith("data: [DONE]\n\n")
+    assert all(isinstance(chunk, str) and "\n" not in chunk for chunk in observed)
+    assert "" in observed and "data: [DONE]" in observed
+    assert (": heartbeat" in observed) is control_fields
+    assert len(state.calls) == 1 and state.closed
+    assert PRIVATE_VALUE not in response.text + json.dumps(state.calls)
+    if include_usage:
+        assert all(chunk["usage"] is None for chunk in chunks[:-1])
+        assert chunks[-1]["choices"] == []
+        assert chunks[-1]["usage"] == {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}
+    else:
+        assert all("usage" not in chunk for chunk in chunks)
+
+
+@pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.asyncio
+async def test_malformed_json_in_line_transport_is_not_silently_skipped(gateway, partial):
+    client, state = gateway
+    state.chunks = []
+    if partial:
+        state.chunks.extend(event({"candidates": [{"content": {"parts": [{"text": "partial"}]}}]}).decode().splitlines())
+    state.chunks.extend([": heartbeat", "", "data: malformed", "", "data: [DONE]", ""])
+    response = await client.post("/v1/chat/completions", json=payload(stream=True, stream_options={"include_usage": True}))
+    assert response.status_code == (200 if partial else 502)
+    chunks = events(response) if partial else [response.json()]
+    assert chunks[-1]["error"]["code"] == "upstream_stream_error"
+    assert not any(chunk.get("usage") for chunk in chunks)
     assert state.closed
 
 
