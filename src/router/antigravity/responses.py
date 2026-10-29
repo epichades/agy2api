@@ -139,6 +139,9 @@ async def create_response(request: Request, _token: str = Depends(authenticate_b
         return _error_json(500, "Responses state key is unavailable", "server_error", "server_error")
 
     notes: List[str] = []
+    if (conv.stream and conv.use_anti_truncation and conv.is_claude
+            and body.get("tool_choice") not in (None, "auto")):
+        conv.note("tool_choice(anti_truncation_auto)")
     has_schema = "responseSchema" in (api_request["request"].get("generationConfig") or {})
     state: Dict[str, Any] = {"account": None}
     session_key = pck_session_key(conv.real_model, conv.prompt_cache_key)

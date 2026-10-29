@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from fastapi import FastAPI, Response
+from fastapi.responses import JSONResponse
 
 
 MODEL = "gemini-3-flash"
@@ -275,6 +276,52 @@ async def test_predata_upstream_error_keeps_http_status(gateway):
     response = await client.post("/v1/chat/completions", json=payload(stream=True))
     assert response.status_code == 429
     assert response.headers["retry-after"] == "7"
+    assert response.headers["content-type"] == "application/json"
+    assert state.closed
+
+
+@pytest.mark.parametrize("anti_truncation", [False, True])
+@pytest.mark.parametrize("response_type", [Response, JSONResponse])
+@pytest.mark.asyncio
+async def test_predata_json_error_does_not_advertise_an_sse_stream(gateway, anti_truncation, response_type):
+    client, state = gateway
+    error = {"error": {"code": 400, "message": "synthetic rejection", "status": "INVALID_ARGUMENT"}}
+    content = json.dumps(error) if response_type is Response else error
+    state.chunks = [response_type(status_code=400, content=content, headers={
+        "content-type": "text/event-stream; charset=utf-8", "content-length": "9999",
+        "content-encoding": "gzip", "transfer-encoding": "chunked", "connection": "keep-alive",
+        "retry-after": "7", "set-cookie": "synthetic-private-cookie",
+    })]
+    response = await client.post("/v1/chat/completions", json=payload(
+        model=("抗截断-" if anti_truncation else "") + MODEL, stream=True,
+        metadata={"private": PRIVATE_VALUE},
+    ))
+    assert response.status_code == 400
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["retry-after"] == "7"
+    assert int(response.headers["content-length"]) == len(response.content)
+    assert response.headers["x-agy-ignored-params"] == "metadata(not_stored)"
+    assert not any(name in response.headers for name in (
+        "content-encoding", "transfer-encoding", "connection", "set-cookie"))
+    assert response.json() == error
+    assert "data:" not in response.text and "[DONE]" not in response.text
+    assert len(state.calls) == 1 and state.closed
+
+
+@pytest.mark.parametrize("anti_truncation", [False, True])
+@pytest.mark.asyncio
+async def test_predata_non_json_error_is_sanitized_json(gateway, anti_truncation):
+    client, state = gateway
+    state.chunks = [Response(status_code=503, content=f"<html>{PRIVATE_VALUE}</html>", headers={
+        "content-type": "text/event-stream", "retry-after": "9",
+    })]
+    response = await client.post("/v1/chat/completions", json=payload(
+        model=("抗截断-" if anti_truncation else "") + MODEL, stream=True))
+    assert response.status_code == 503
+    assert response.headers["content-type"] == "application/json"
+    assert response.headers["retry-after"] == "9"
+    assert response.json()["error"]["code"] == "upstream_stream_error"
+    assert PRIVATE_VALUE not in response.text
     assert state.closed
 
 

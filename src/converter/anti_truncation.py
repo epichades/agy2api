@@ -3,9 +3,9 @@ Anti-Truncation Module - Synthetic Tool Call Approach
 通过注入合成工具（emit_answer）让模型将最终回答放入 functionCall 的 content 参数中，
 网关再从 functionCall 中提取内容还原为普通 assistant 文本，以此绕过外审截断。
 
-强制手段：toolConfig.functionCallingConfig.mode=ANY + allowedFunctionNames
-在结构上要求模型调用允许的工具之一（含 emit_answer），提示词仅作为内容质量说明；
-上游忽略 toolConfig 时由流式处理器兜底（透传普通文本 / 续传）。
+Gemini 函数工具使用 ANY + allowedFunctionNames；Claude 使用 AUTO 加提示词，
+避免不支持强制工具的模型报错，以及强制工具跳过模型原有 thinking。
+存在内置工具时同样使用 AUTO；流式处理器兼容普通文本和合成工具输出。
 
 参考: https://github.com/Xeltra233/Antigravity-anti-truncation-gateway
 """
@@ -104,13 +104,16 @@ def _has_non_function_tool(tools: List[Dict[str, Any]]) -> bool:
     return False
 
 
-def _resolve_function_calling_mode(tools: List[Dict[str, Any]]) -> Tuple[str, bool]:
+def _resolve_function_calling_mode(tools: List[Dict[str, Any]], model: str = "") -> Tuple[str, bool]:
     """决定注入的 functionCallingConfig。
 
-    默认注入 ANY + allowedFunctionNames（含 emit_answer）做结构级强制；
+    Claude 不强制工具调用：部分模型拒绝 ANY，其余模型强制调用时会跳过 thinking。
+    其他模型默认注入 ANY + allowedFunctionNames（含 emit_answer）做结构级强制；
     存在无法枚举的非函数工具（googleSearch 等）时 allowedFunctionNames
     会 block 内置能力，自动回退 AUTO。
     """
+    if "claude" in model.lower():
+        return "AUTO", False
     if not _has_non_function_tool(tools):
         return "ANY", True
     return "AUTO", False
@@ -147,13 +150,14 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
         tools.append({"functionDeclarations": [SYNTHETIC_TOOL_DECLARATION]})
         request_data["tools"] = tools
 
-    # 2. 注入 toolConfig.functionCallingConfig，结构上强制模型调用 emit_answer
+    # 2. 依模型能力选择合成工具策略，不改动模型或 thinking 配置。
     #    深拷贝 toolConfig：避免内层 dict 与调用方共享引用被原地改写污染
     tool_config = json.loads(
         json.dumps(request_data.get("toolConfig") or {}, ensure_ascii=False)
     )
     func_config = dict(tool_config.get("functionCallingConfig") or {})
-    mode, use_allowed = _resolve_function_calling_mode(tools)
+    is_claude = "claude" in str(payload.get("model") or "").lower()
+    mode, use_allowed = _resolve_function_calling_mode(tools, str(payload.get("model") or ""))
     func_config["mode"] = mode
     if use_allowed:
         # 合并调用方已有的 allowedFunctionNames（若有），统一去重保序
@@ -173,12 +177,14 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
             flush=True,
         )
     else:
-        # AUTO 回退：保留调用方原有配置，仅覆盖 mode
+        # AUTO relies on the prompt, not a forced/restricted tool selection.
+        # Retaining an old allowlist would still restrict the helper or built-ins.
+        func_config.pop("allowedFunctionNames", None)
         tool_config["functionCallingConfig"] = func_config
         request_data["toolConfig"] = tool_config
+        reason = "Claude preserves model thinking" if is_claude else "non-function tools present"
         _privacy_print(
-            "Anti-truncation: toolConfig mode=AUTO (non-function tools present), "
-            "relying on instruction only",
+            f"Anti-truncation: toolConfig mode=AUTO ({reason}), relying on instruction only",
             flush=True,
         )
 

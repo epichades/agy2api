@@ -83,7 +83,10 @@ Chat Completions 接受常见 SDK 附加参数与合法 `null`；只有已实现
 **特殊功能变体：**
 - **抗截断模式**：在模型名称前添加 `抗截断-` 前缀
   - 例：`抗截断-gemini-2.5-pro`
-  - 通过合成工具调用绕过截断限制，确保完整回答（流式和非流式均有效）
+  - 流式请求使用合成 `emit_answer` 工具与有界续传尝试；不保证每次回答都完整，非流式不会启用续传。
+  - Claude 使用 `AUTO` 选择工具并由提示词引导，保留原模型和 thinking，不强制调用 `emit_answer`。模型也可以直接返回文字；Gemini 的纯函数工具模式仍使用 `ANY`。
+  - Claude 抗截断模式若覆盖明确的 `tool_choice` 限制，会回报 `tool_choice(anti_truncation_auto)`。普通模式不改写用户的强制工具选择；不支持该能力的上游会明确拒绝。[Claude 工具选择限制](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)
+  - 此模式会改写输出表示，原有处理器也会替换真实 thoughtSignature，因此不是无损 history 通道。需要原始思考签章与工具回放保真的 Codex／Claude 对话，请使用不带此前缀的模型；保留 thinking 设置不等于签章原样保留。
 - **图像生成模型**支持分辨率（`-2k`、`-4k`）和比例（`-16x9`、`-9x16` 等）后缀
 
 ## 配置说明

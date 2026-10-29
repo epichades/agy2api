@@ -25,6 +25,7 @@
 | Gemini 簽名 | 已簽名的 reasoning 可用 `agy2.` 狀態回放；function-call 簽名以受保護的 call_id 承載，後續恢復原始上游 ID、名稱與簽名。一般文字 part 的簽名仍缺少通用 Responses 回放位置，會回報 `upstream.text_signature(not_replayable)` |
 | SSE | 有 created／in_progress、output items、delta、completed／incomplete／failed 與 sequence_number；支援 UTF-8 分片。畸形資料會失敗，不會在後續 STOP 時偽裝成功，也不會繼續交付其後的工具事件 |
 | 串流中斷與取消 | 已交付內容後不重新發出整個上游請求。失敗會終止為 failed；客戶端取消／關閉時釋放上游 iterator。尚未交付內容的重試仍受伺服器重試設定控制 |
+| 抗截斷變體 | 只在串流啟用有界續傳。Claude 以 `AUTO` 配合提示詞引導合成 `emit_answer`，不更換模型或關閉 thinking，也不保證必定呼叫合成工具；覆寫明確 `tool_choice` 限制時回報 `tool_choice(anti_truncation_auto)`。非抗截斷模式維持原工具選擇，供應商不支援時明確拒絕 |
 | token 上限 | 尊重較小的請求值，最高為 64000。超過上限時回應 echo 有效的 64000，並明確回報 cap |
 | 上游 metadata | 支援的 modelVersion、usage、grounding／citation／URL context、安全評分等保留於 `x_agy_upstream` 擴充欄位；可在送出 headers 前取得時，另回傳 `x-agy-upstream-model-version` |
 | 圖片與多模態 | 輸入僅支援 user message 的 Base64 image data URL。圖片 detail 不生效，會回報；支援的上游圖片／程式執行內容會以 Markdown 呈現，並於擴充欄位保留結構及回報轉換 |
@@ -32,6 +33,8 @@
 `prompt_cache_key` 用於衍生會話帳號親和 key，不是原生 prompt-cache retention 或命中保證。帶有已認證回放歷史時，歷史 owner 直接約束帳號選擇；程序重啟、記憶體綁定 TTL 過期或快取指向另一帳號，仍須找回原帳號，驗證成功後才更新綁定。原帳號已刪除、停用、冷卻、無該模型權限或無法取得憑證時回 `409 state_account_unavailable`，避免跨帳號傳送歷史；不會靠重試改用別的帳號。此保護同時適用原生 Messages 的加密回放。
 
 `reasoning.effort` 目前接受但列為 ignored，不控制 Claude 的推理深度；深度取決於精確模型 ID 及上游模型政策。不要將此欄位的 echo 視為已實際生效。
+
+`抗截断-` 是有損的輸出改寫模式：既有處理器會將真實 `thoughtSignature` 替換成跳過驗證的 placeholder，合成工具也會被轉成文字。一般模型的簽章保留與真實重播驗收不能延伸解讀為此前綴模式無損；需要保真時使用不帶此前綴的精確模型 ID。
 
 ## 不支援與需要檢查的回報
 

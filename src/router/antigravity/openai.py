@@ -170,6 +170,25 @@ def _sse_json(data):
     return ("data: " + json.dumps(data) + "\n\n").encode("utf-8")
 
 
+def _chat_http_error(response):
+    """A pre-stream HTTP error is JSON, regardless of provider SSE headers."""
+    headers = {}
+    if "retry-after" in response.headers:
+        headers["retry-after"] = response.headers["retry-after"]
+    try:
+        content = json.loads(response.body)
+        if not isinstance(content, dict) or "error" not in content:
+            raise ValueError("Expected an upstream JSON error")
+        # Rebuild representation headers: the upstream response may advertise
+        # SSE or still carry compression/length headers for its decoded body.
+        return JSONResponse(content=content, status_code=response.status_code, headers=headers)
+    except (ValueError, TypeError, UnicodeError):
+        # An HTML/proxy/malformed body can contain private deployment details.
+        return JSONResponse(status_code=response.status_code, headers=headers, content={
+            "error": {"message": "Upstream request failed", "type": "server_error", "code": "upstream_stream_error"}
+        })
+
+
 async def _chat_stream(source, model, include_usage, notes):
     response_id = str(uuid.uuid4())
     decoder = _SSEDecoder()
@@ -213,7 +232,7 @@ async def _chat_stream(source, model, include_usage, notes):
         async for chunk in source:
             if isinstance(chunk, Response):
                 if not started:
-                    yield chunk
+                    yield _chat_http_error(chunk)
                 else:
                     # Do not forward provider error bodies (which may contain
                     # credential/URL details) or fabricate a successful finish.
@@ -280,7 +299,6 @@ async def chat_completions(
 
     # 转换为字典
     normalized_dict, notes = _prepare_chat_request(openai_request)
-    response_headers = {"x-agy-ignored-params": ",".join(notes)} if notes else {}
 
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(openai_request.model)
@@ -288,6 +306,12 @@ async def chat_completions(
 
     # 获取流式标志
     is_streaming = bool(openai_request.stream)
+    choice = normalized_dict.get("tool_choice")
+    if (is_streaming and use_anti_truncation and "claude" in real_model.lower()
+            and choice is not None and choice != "auto"
+            and not (isinstance(choice, dict) and choice.get("type") == "auto")):
+        notes.append("tool_choice(anti_truncation_auto)")
+    response_headers = {"x-agy-ignored-params": ",".join(notes)} if notes else {}
 
     # 对于抗截断模型的非流式请求，给出警告
     if use_anti_truncation and not is_streaming:

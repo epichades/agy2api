@@ -292,6 +292,11 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
         return _native_error(500, "Private replay state key is unavailable")
     api_request = {"model": gemini.pop("model"), "request": gemini}
     log_ctx = {"api_format": "anthropic", "client_ip": request.client.host if request.client else "", "client_model": claude_request.model}
+    use_anti_truncation = is_anti_truncation_model(claude_request.model) and claude_request.stream
+    choice = normalized.get("tool_choice")
+    if (use_anti_truncation and "claude" in real_model.lower()
+            and choice is not None and choice.get("type") != "auto"):
+        notes.append("tool_choice(anti_truncation_auto)")
     headers = {"x-agy-ignored-params": ",".join(dict.fromkeys(notes))} if notes else {}
     selected = {"account": None}
 
@@ -311,7 +316,6 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
     def stream(payload):
         return stream_request(body=payload, native=False, log_ctx=log_ctx, on_credential=on_credential,
                               required_account_hash=required_account_hash)
-    use_anti_truncation = is_anti_truncation_model(claude_request.model) and claude_request.stream
     if is_anti_truncation_model(claude_request.model) and not claude_request.stream:
         notes.append("anti_truncation(non_stream)")
         headers["x-agy-ignored-params"] = ",".join(dict.fromkeys(notes))
