@@ -1,6 +1,6 @@
 # 上游整合與待辦修正完成報告
 
-完成日期：2026-10-29（Asia/Taipei）。本次完成前次評估列出的程式、部署設定、相容性、隱私與發布整理待辦；原有修改已保留。後續依使用者要求將原始碼上傳 GitHub，保留遠端既有 Actions 設定，提交加上 `[skip ci]`。沒有部署 VPS 或使用真實模型帳號。下列「通過」均限定所列測試範圍，不等於已驗收遠端供應商或正式服務。
+完成日期：2026-10-29（Asia/Taipei）。本次完成前次評估列出的程式、部署設定、相容性、隱私與發布整理待辦；原有修改已保留。後續依使用者要求將原始碼上傳 GitHub，保留遠端既有 Actions 設定，提交加上 `[skip ci]`。已進行本機合成驗證及 Grok Bot 隔離環境的有限真實模型 HTTP 驗證，正式服務尚未切換。下列「通過」均限定所列版本、路徑和案例，不代表所有客戶端或正式部署均已驗收。
 
 ## 上游 8 個提交：全數納入
 
@@ -39,7 +39,9 @@
 
 ## 2026-10-29 後續相容性與操作修正
 
-- 修正 `46641c9` 的 Chat Completions 嚴格模型造成常見 SDK 欄位 422 的回歸。現在接受常見擴充，維持核心型別驗證與上游欄位白名單，未套用選項只回報名稱；47 項 ASGI／串流案例涵蓋 `null`、未知欄位、usage、UTF-8 分片、取消及錯誤。`include_usage` 另發標準結尾事件，Chat 抗截斷按每個上游 attempt 的最後累積計數加總，缺漏明確標為不完整。
+- 修正 `46641c9` 的 Chat Completions 嚴格模型造成常見 SDK 欄位 422 的回歸。現在接受常見擴充，維持核心型別驗證與上游欄位白名單，未套用選項只回報名稱；63 項 ASGI／串流案例涵蓋 `null`、未知欄位、usage、UTF-8 分片、取消及錯誤。`include_usage` 另發標準結尾事件，Chat 抗截斷按每個上游 attempt 的最後累積計數加總，缺漏明確標為不完整。
+- 真實上游驗證發現 `91f5c0b` 的 Chat decoder 將 `httpx.aiter_lines()` 無換行字串直接拼接，造成 `JSONDecodeError`；`4fb6853` 恢復字串行邊界，同時修正 Responses 遇到合法心跳／控制欄位的同源問題。新增 19 項回歸實際經過 HTTPX line transport，保留 bytes 增量解析、usage 結尾及 malformed JSON 拒絕。
+- 抗截斷真工具之後的獨立 finish／usage frame 原樣保留，工具只交付一次；缺少真正 finish 時明確失敗，不以合成工具補造 STOP。非串流未啟用抗截斷的狀態也會在回應提示，含上游錯誤路徑。
 - 已認證歷史 owner 直接約束帳號選取；重啟、TTL 過期或錯誤 cache 都不會改用別的帳號。驗證通過後才更新綁定；原帳號不可用回 409。31 項回歸涵蓋 Responses、原生 Claude、重試及 callback 失敗；獨立複查相關 55 項通過。
 - `loop.sh` 使用受管 supervisor；`restart.sh` 對受管程序送出限時重啟，`stop` 只停止自己的 child process group。備份工具包含完整專案、實際憑證目錄、指定私密環境檔、SQLite 一致性快照及 checksum，還原只寫入新 staging。這些工具以合成程序與資料驗證，尚不代表既有目標主機已完成備份／切換。
 - `/version/info` 增加程序啟動時的 build commit／來源／dirty；無 Git 的產物可指定 `AGY_BUILD_SHA`，不再以舊 `version.txt` 冒充目前部署版本。
@@ -47,11 +49,11 @@
 
 ## 實際客戶端與原生程序證據
 
-所有探針使用合成 key、隔離暫存狀態與 loopback 假上游；沒有真實 Google／Claude 推論，也沒有公開原始提示詞、token、JWT、金鑰或 callback URL。
+本節的本機探針使用合成 key、隔離暫存狀態與 loopback 假上游；真實上游 HTTP 驗證另列下一節。沒有公開原始回應、token、JWT、金鑰或 callback URL。
 
 | 驗證 | 實際結果與界線 |
 |---|---|
-| 完整離線測試 | [run_offline_checks.py](tests/run_offline_checks.py)：**331 passed、無 xfail**；1 個 Starlette 相依棄用警告。程序生命週期案例需要允許本機私有 Unix socket |
+| 完整離線測試 | [run_offline_checks.py](tests/run_offline_checks.py)：**429 passed、無 xfail**；1 個 Starlette 相依棄用警告。程序生命週期案例需要允許本機私有 Unix socket |
 | Responses golden／helper 合約 | **15/15 passed**；只驗證已列出的轉換與事件契約 |
 | Codex CLI 0.155.1 | 保留完整 Apps／plugins 工具集，Claude 及 Gemini 路徑均完成假上游簽章工具循環；各工具循環均為兩次 HTTP 200、CLI exit 0；長工具名、合成工具結果及回放簽章通過。這是實際客戶端傳輸／工具契約驗證，不是模型品質或真實授權驗收 |
 | Claude Code 2.1.263 | 原生 Messages 路徑通過預設 omitted thinking 文字與簽章 Bash 工具循環；opaque 回放成功且 omitted 模式未明文暴露思考／簽章，對端仍是假上游 |
@@ -59,6 +61,21 @@
 | 原始碼／發布檢查 | `git diff --check` 與工作樹私密預檢通過；前端 build、Shell 語法、lock 與 pip 相依檢查通過。中間分支的歷史門檻預期阻擋舊 fixture 資料，因此不發布該分支，只交付直接承接上游的乾淨快照 |
 
 可重跑入口為 [Codex probe](tests/responses/run_codex_compat_probe.py)、[Claude Code probe](tests/run_claude_compat_probe.py) 及原生 smoke。實際 client 需本機安裝相應版本與 loopback 權限；工具探針只執行受控合成命令，不能拿來宣稱所有 client 版本或所有外掛均已驗收。
+
+## 隔離環境真實上游驗證
+
+透過 Grok Bot 的既有專案工作者執行，以下為其去識別驗證回報；私密原始報告、備份、部署路徑與環境值不納入 Git。正式服務維持原版，測試使用獨立 checkout、loopback listener、憑證資料庫複本及獨立執行環境。
+
+- 已備份程式、依賴、啟動設定、私密環境與實際憑證資料庫。SQLite 使用 backup API，checksum、quick_check、integrity_check 通過；另在新目錄解開並驗證 Git、interpreter、套件匯入及必要設定。沒有執行正式服務的還原切換，不能視為完整災難復原演練。
+- `91f5c0b`：Gemini／Opus 的 Chat 非串流接受常見 SDK 參數，未支援語意有明示；Responses 串流／非串流完成，工具參數字串保持型別；Opus 原生 Messages 工具往返通過。Chat 串流曾實測失敗，已定位並修正，不能沿用此舊提交作為已通過版本。
+- 同一 state key 下，Responses 與 native Messages 的認證 history 跨重啟回到原 owner；停用 staging owner 後回 409，日誌與 usage 記錄沒有替代帳號的上游請求，恢復 owner 後成功。實際回放使用 `agy2.` reasoning／signature；本輪上游沒有提供 functionCall 的 thoughtSignature，因此 signed tool ID 的真實上游案例未覆蓋，仍以本機合成案例驗證。
+- 未授權、錯誤密碼、未知模型及八小時 panel session 通過。現場沒有 Codex／Claude Code CLI；真實上游證據是手寫 HTTP，不能與本機合成 CLI probe 合併宣稱完整 CLI 真實上游驗收。
+
+`4fb6853` 已通過 Gemini／Opus 的純 Chat 串流、常見 SDK 選項、include_usage true／false、結尾用量、完整終止與工具參數型別，以及 Responses 串流／非串流與已保存的原 owner 簽章 history 重播。現場仍發現 Claude 抗截斷的強制工具選擇被拒絕，及該錯誤的 Content-Type 不正確；已在 `261d3c9` 修正，其純文字、用量及 JSON 錯誤格式已通過真實驗證。其後在帶真工具的抗截斷串流發現獨立 finish frame 被遺漏，`b33432f` 已修正並新增分段／缺失結尾／取消案例，受影響的 Chat／Responses 工具串流及普通 Opus smoke 皆於該提交第一次重測通過：工具只交付一次，沒有合成工具外漏、error 或 failed，finish／completed 與用量完整。
+
+最終程式實測提交為 `b33432f6a0ee0f99a575804d69ef718eadc410b9`；上述本機 Codex／Claude Code 合成 CLI 探針也在此提交重跑通過。後續僅更新本報告，沒有更動執行程式。所有 staging listener 已停止，正式服務保持原程式與啟動設定，備份 manifest 再次驗證通過。
+
+Claude 抗截斷現在使用 AUTO 配合提示詞，保留模型和 thinking 設定；若覆寫 caller 明確工具選擇則回報 `tool_choice(anti_truncation_auto)`。普通模式仍保留強制工具選擇，供應商不支援時回正確 JSON 錯誤。此模式原有的簽章 placeholder 改寫未移除，不能宣稱 anti history 無損；保真對話應使用沒有此前綴的模型。長時間負載、完整配額／OAuth 生命週期、反向代理、正式切換和正式還原仍需另行驗收。
 
 ## 必須維持的設定與升級規則
 
@@ -73,7 +90,7 @@
 
 ## 尚未驗證與能力界線
 
-以下屬實際環境驗收，沒有執行證據，不能標為通過：Docker build／container runtime（含 amd64／arm64）、目標 VPS 與 systemd、真實 Redis 服務、PostgreSQL、Google OAuth／token 刷新與模型配額、真實 Claude／Gemini 推論、長時間負載、容量、反代全鏈 SSE timeout／取消及正式備份還原。
+以下尚無完整執行證據，不能標為通過：Docker build／container runtime（含 amd64／arm64）、目標 VPS 與 systemd、真實 Redis 服務、PostgreSQL、完整 OAuth／token 刷新與模型配額生命週期、實際 CLI 對真實上游、長時間負載、容量、反代全鏈 SSE timeout／取消及正式服務切換／還原。有限真實模型 HTTP 與備份解開檢查僅覆蓋上一節列出的案例。
 
 readiness 200 只證明本機服務與所配置存儲可用，不代表上述上游能力。此版本仍是明確能力集合的協定轉接器；OpenAI 內建工具、伺服器端對話儲存／compaction、原生網路搜尋與其他未實作能力不能因端點名稱相同就視為支援。詳細保留、拒絕及降級契約見 RESPONSES_API。GitHub 交付只含原始碼分支，不建立遠端發布或對 VPS 套用設定。
 
