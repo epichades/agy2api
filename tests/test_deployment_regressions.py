@@ -165,5 +165,5 @@ def test_restart_script_is_portable_and_does_not_execute_dotenv(tmp_path):
     python.chmod(0o755)
     result = subprocess.run(['bash', str(script)], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0
-    assert result.stdout.splitlines() == [str(folder), 'web.py']
+    assert result.stdout.splitlines() == [str(folder), 'scripts/service_control.py restart']
     assert not marker.exists()

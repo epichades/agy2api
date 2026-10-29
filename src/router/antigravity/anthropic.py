@@ -266,6 +266,10 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
     try:
         notes, tool_names = _validate_capabilities(normalized, request)
         normalized, owners = _restore_native_replay(normalized)
+        owner_hashes = {owner["a"] for owner in owners}
+        if len(owner_hashes) > 1:
+            raise ValueError("Replay history contains different authenticated account owners")
+        required_account_hash = next(iter(owner_hashes), None)
         real_model = get_base_model_from_feature_model(claude_request.model)
         normalized["model"] = real_model
         gemini = await anthropic_to_gemini_request(normalized)
@@ -305,7 +309,8 @@ async def messages(claude_request: ClaudeRequest, request: Request, _token: str 
         return replay_state.CALL_ID_PREFIX + blob[len(replay_state.PREFIX):]
 
     def stream(payload):
-        return stream_request(body=payload, native=False, log_ctx=log_ctx, on_credential=on_credential)
+        return stream_request(body=payload, native=False, log_ctx=log_ctx, on_credential=on_credential,
+                              required_account_hash=required_account_hash)
     use_anti_truncation = is_anti_truncation_model(claude_request.model) and claude_request.stream
     if is_anti_truncation_model(claude_request.model) and not claude_request.stream:
         notes.append("anti_truncation(non_stream)")

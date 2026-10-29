@@ -42,9 +42,16 @@ requests_seen = []
 upstream_seen = []
 tool_verified = False
 
-async def fake_stream(body, native=False, log_ctx=None, session_key_override=None, on_credential=None):
+async def fake_stream(body, native=False, log_ctx=None, session_key_override=None, on_credential=None,
+                      required_account_hash=None):
     global tool_verified
-    upstream_seen.append({'model': body.get('model'), 'session_key_supplied': bool(session_key_override)})
+    upstream_seen.append({'model': body.get('model'), 'session_key_supplied': bool(session_key_override),
+                          'replay_owner_constraint_supplied': bool(required_account_hash)})
+    if required_account_hash:
+        from src.responses.encrypted import account_hash
+        if required_account_hash != account_hash('synthetic@example.invalid'):
+            yield route._error_json(409, 'Synthetic replay owner mismatch', 'invalid_request_error', 'state_account_mismatch')
+            return
     if on_credential:
         on_credential('synthetic@example.invalid', body)
     inner = body['request']

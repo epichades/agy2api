@@ -54,6 +54,8 @@
 
 共用 logger 現在會遮罩 email、代理帳密、Bearer／部分 token，以及已知私密 query 名稱，例如 `key`、`code`、`state`；也會辨識經 URL 編碼的參數名稱。啟動時會將相同過濾套用至 Uvicorn 標準 logger 的控制台與檔案輸出，包含格式化參數及例外文字。這些是針對性過濾，不是完整資料去識別化：任意提示詞、原始碼、未知參數名稱與未接入的第三方 logger 仍需避免記錄。
 
+需要從文字日誌區分帳號時，可於私密環境設定 `LOG_ACCOUNT_TAG_KEY`，使用至少 32 bytes 的獨立隨機值。email 會轉為穩定的 `[account:…]` HMAC 代號；同一金鑰可跨重啟比對，不必恢復明文 email 或啟用 usage DB。未設定或值過短時仍使用 `[email]`。不要重用 API／面板密碼或 Responses 狀態金鑰；只備份於私密設定，範例保持空值。輪替此 key 會改變代號，但不影響 Responses 對話。代號仍可串聯活動，日誌仍須受控保存；受面板 token 保護的 usage 查詢則保留原有帳號資訊，僅在明確啟用 usage 記錄後產生新資料。
+
 Gemini 支援 `?key=` 認證；即使已修正程式內 query 遮罩，仍建議避免讓敏感 URL 進入日誌。`python web.py` 會停用 Uvicorn access log；若改用 Uvicorn CLI，應明確加入 `--no-access-log`。反向代理也應停用或清理 query/body/header 紀錄，不要記錄完整含 query 的 URL。程式內的 logger 過濾不會清理反向代理、客戶端或外部平台產生的紀錄。
 
 `LOG_FILE` 建議放在受限的 `data/` 內或 repo 外；它的預設輪替容量為每檔 10 MiB、2 份備份，可由 `LOG_FILE_MAX_BYTES`／`LOG_FILE_BACKUPS` 調整。此輪替只適用該文字日誌，不限制 usage DB 或詳細請求檔容量。這兩類資料沒有自動到期清理保證，需另訂保留與刪除程序。

@@ -17,7 +17,7 @@
 | [07ec1aa](https://github.com/su-kaka/agy2api/commit/07ec1aa) | 保留設定頁修正的上游合併歷史 |
 | [6cc4562](https://github.com/su-kaka/agy2api/commit/6cc4562) | 保留上游目前版本紀錄，作為乾淨發布基底 |
 
-前端由整合後來源重新建置；沒有將上游 dist 直接覆蓋本機隱私修正。原始碼交付使用 `codex/agy2api-source`：最終快照提交直接以 `6cc4562` 為 parent，`.github/workflows` 保持與遠端原有版本一致，不新增 CI workflow，也不建立 PR 或 tag 觸發建置。完整 CI 修改仍保留於本機 `codex/agy2api-ready`。舊 master、原 bundle／備份 refs 與中間整合分支不推送；它們保留在本機供回復，不能使用 `push --mirror` 發布。
+前端由整合後來源重新建置；沒有將上游 dist 直接覆蓋本機隱私修正。原始碼交付使用 `codex/agy2api-source`：初始乾淨快照 `46641c9` 直接以 `6cc4562` 為 parent，後續修正承接該快照；`.github/workflows` 保持與遠端原有版本一致，不新增 CI workflow，也不建立 PR 或 tag 觸發建置。CI 修改另保留於本機 `codex/agy2api-ready`，該分支未包含本節之後的修正。舊 master、原 bundle／備份 refs 與中間整合分支不推送；它們保留在本機供回復，不能使用 `push --mirror` 發布。
 
 此方式保留全部上游血緣，同時避免讓含舊私人部署筆記的本機 5 個提交成為發布祖先。既有公開上游歷史不在本次重寫範圍；沒有執行遠端歷史重寫或憑證撤銷。`src/api/Response_example.txt` 已取消追蹤，僅作被忽略的本機檔保留，不納入發布快照。
 
@@ -37,13 +37,21 @@
 
 已修復的案例已轉成一般 regression，沒有保留 xfail 來遮掩失敗；原先「完整 Codex 工具集一定 400」「工具字串會變型」「輸出後會重送」等結論不再適用目前修正版。
 
+## 2026-10-29 後續相容性與操作修正
+
+- 修正 `46641c9` 的 Chat Completions 嚴格模型造成常見 SDK 欄位 422 的回歸。現在接受常見擴充，維持核心型別驗證與上游欄位白名單，未套用選項只回報名稱；47 項 ASGI／串流案例涵蓋 `null`、未知欄位、usage、UTF-8 分片、取消及錯誤。`include_usage` 另發標準結尾事件，Chat 抗截斷按每個上游 attempt 的最後累積計數加總，缺漏明確標為不完整。
+- 已認證歷史 owner 直接約束帳號選取；重啟、TTL 過期或錯誤 cache 都不會改用別的帳號。驗證通過後才更新綁定；原帳號不可用回 409。31 項回歸涵蓋 Responses、原生 Claude、重試及 callback 失敗；獨立複查相關 55 項通過。
+- `loop.sh` 使用受管 supervisor；`restart.sh` 對受管程序送出限時重啟，`stop` 只停止自己的 child process group。備份工具包含完整專案、實際憑證目錄、指定私密環境檔、SQLite 一致性快照及 checksum，還原只寫入新 staging。這些工具以合成程序與資料驗證，尚不代表既有目標主機已完成備份／切換。
+- `/version/info` 增加程序啟動時的 build commit／來源／dirty；無 Git 的產物可指定 `AGY_BUILD_SHA`，不再以舊 `version.txt` 冒充目前部署版本。
+- 選用 `LOG_ACCOUNT_TAG_KEY` 以獨立私密 HMAC 金鑰產生帳號代號，保留 email 遮罩；管理腳本登入取得八小時 token 的遷移方式已補入 DEPLOY，模型 API 認證維持分離。
+
 ## 實際客戶端與原生程序證據
 
 所有探針使用合成 key、隔離暫存狀態與 loopback 假上游；沒有真實 Google／Claude 推論，也沒有公開原始提示詞、token、JWT、金鑰或 callback URL。
 
 | 驗證 | 實際結果與界線 |
 |---|---|
-| 完整離線測試 | [run_offline_checks.py](tests/run_offline_checks.py)：**241 passed、無 xfail**；1 個 Starlette 相依棄用警告 |
+| 完整離線測試 | [run_offline_checks.py](tests/run_offline_checks.py)：**331 passed、無 xfail**；1 個 Starlette 相依棄用警告。程序生命週期案例需要允許本機私有 Unix socket |
 | Responses golden／helper 合約 | **15/15 passed**；只驗證已列出的轉換與事件契約 |
 | Codex CLI 0.155.1 | 保留完整 Apps／plugins 工具集，Claude 及 Gemini 路徑均完成假上游簽章工具循環；各工具循環均為兩次 HTTP 200、CLI exit 0；長工具名、合成工具結果及回放簽章通過。這是實際客戶端傳輸／工具契約驗證，不是模型品質或真實授權驗收 |
 | Claude Code 2.1.263 | 原生 Messages 路徑通過預設 omitted thinking 文字與簽章 Bash 工具循環；opaque 回放成功且 omitted 模式未明文暴露思考／簽章，對端仍是假上游 |
@@ -57,6 +65,7 @@
 - `WORKERS=1` 是明確支援界線；原生入口／lifespan 拒絕其他值。設定讀取同步修正與 Redis 依賴補齊，不等於 OAuth、跨實例或高可用已完成驗收。
 - `API_PASSWORD`、`PANEL_PASSWORD` 使用不同的私密隨機值；實際值留在 `.env`／部署秘密管理，不提交到 GitHub。預設精確模型 ID，不暗中換模型。
 - 保護並備份 `CREDENTIALS_DIR/responses-state.key`；也可私下指定有效 `RESPONSES_STATE_KEY`。此金鑰與 API／panel 密碼分離，重啟沿用同一份。
+- 如啟用 `LOG_ACCOUNT_TAG_KEY`，另行備份這份獨立私密設定；未啟用時日誌仍使用通用 email 遮罩。
 - agy1 不再接受；舊格式對話需重新開始。金鑰遺失／輪替也會中斷舊加密回放，不承諾無縫延續。
 - 預設不丟棄思考歷史來恢復成功；`RESPONSES_ALLOW_HISTORY_FALLBACK=1` 是操作者明確允許降級，不屬無損模式。
 - Compose 的新 named volumes 不自動搬移舊 bind 資料；先停機、備份、copy、修正權限並核對，再啟動。步驟見 DEPLOY；不使用 `down -v`。

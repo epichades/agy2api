@@ -43,6 +43,10 @@ docker compose up -d --no-build
 - 自动模型名称映射和思维模式检测
 - 多种认证方式：Bearer 头部、x-api-key、x-goog-api-key、URL 参数 key
 
+Chat Completions 接受常见 SDK 附加参数与合法 `null`；只有已实现的字段会送往上游。未套用项目通过 `x-agy-ignored-params` 响应头及 `x_agy_ignored_params` 扩展字段报告，只包含名称、不包含参数值。`metadata` 不保存，`reasoning_effort` 不改变精确模型，`parallel_tool_calls=false` 目前不会强制串行。legacy functions、音频输出等不支持的能力仍明确拒绝。
+
+请求 `stream_options.include_usage=true` 时，一般事件的 `usage=null`，结束前另发 `choices=[]` 的用量事件；未请求时不输出流式 usage。Chat 抗截断续传会按每轮最终计数汇总，任一轮缺少用量则报告 `upstream_usage_incomplete`，不会将部分计数当作完整总量。核心消息／字段类型及回放签章验证仍然保留。
+
 ### 📊 智能凭证管理系统
 
 - 多个 Google OAuth 凭证自动轮换（随机负载均衡）

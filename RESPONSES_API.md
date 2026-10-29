@@ -29,7 +29,7 @@
 | 上游 metadata | 支援的 modelVersion、usage、grounding／citation／URL context、安全評分等保留於 `x_agy_upstream` 擴充欄位；可在送出 headers 前取得時，另回傳 `x-agy-upstream-model-version` |
 | 圖片與多模態 | 輸入僅支援 user message 的 Base64 image data URL。圖片 detail 不生效，會回報；支援的上游圖片／程式執行內容會以 Markdown 呈現，並於擴充欄位保留結構及回報轉換 |
 
-`prompt_cache_key` 用於衍生會話帳號親和 key，不是原生 prompt-cache retention 或命中保證。帳號無法繼續服務時，若有受保護歷史，預設回 409，避免更換帳號時丟棄簽名。
+`prompt_cache_key` 用於衍生會話帳號親和 key，不是原生 prompt-cache retention 或命中保證。帶有已認證回放歷史時，歷史 owner 直接約束帳號選擇；程序重啟、記憶體綁定 TTL 過期或快取指向另一帳號，仍須找回原帳號，驗證成功後才更新綁定。原帳號已刪除、停用、冷卻、無該模型權限或無法取得憑證時回 `409 state_account_unavailable`，避免跨帳號傳送歷史；不會靠重試改用別的帳號。此保護同時適用原生 Messages 的加密回放。
 
 `reasoning.effort` 目前接受但列為 ignored，不控制 Claude 的推理深度；深度取決於精確模型 ID 及上游模型政策。不要將此欄位的 echo 視為已實際生效。
 
@@ -71,7 +71,7 @@ Codex 把本機 MCP／Apps 功能宣告為一般 function／namespace，與 `too
 金鑰不從 API_PASSWORD／PANEL_PASSWORD 衍生，也不在每次程序啟動時隨機更換。持久化 credentials 目錄或私有環境金鑰，並以和憑證同等嚴格的方式備份。金鑰遺失／輪替後，舊狀態不能回放，需重新開始對話；僅輪替 API 密碼不應破壞原金鑰。
 
 - 舊 `agy1.`、遭竄改、非標準或外來狀態回 400；不做不安全的 legacy fallback。
-- 模型不符回 400；所選帳號與認證歷史不符預設回 409，不暗中刪除歷史。
+- 模型不符或同一歷史混合不同 owner 回 400；所選帳號與認證歷史不符回 409，不暗中刪除歷史。
 - 回放明文上限 4 MiB、編碼封包上限 6 MiB；不執行解壓縮。無法保存或使用金鑰時不宣稱成功回放。
 - `reasoning.summary="none"` 不顯示思考原文；若要求 encrypted_content，客戶端可保存並原樣交回 ciphertext，但單憑 blob 或 API 密碼不能解出原文。
 - 原始思考、signature、key、對話與客戶端紀錄仍不可放進 GitHub／issue。認證加密不是讓紀錄可任意公開的許可。
@@ -82,7 +82,7 @@ Codex 把本機 MCP／Apps 功能宣告為一般 function／namespace，與 `too
 
 `RESPONSES_ALLOW_HISTORY_FALLBACK=0` 是預設。上游拒絕簽名時，直接返回該失敗，不自動清掉思考再重試。
 
-只有設為 `1` 才允許在同模型下移除回放思考，必要時關閉該輪 thinking；換帳號的簽名移除還需 `RESPONSES_STRIP_SIG_ON_ACCOUNT_SWITCH=1`。這些是有損處理，不是保真恢復。header 與最終 response 都會報告 `thinking_history_dropped`、`thinking_disabled_for_turn` 或 `thinking_history_dropped(account_switch)`，操作者必須接受其影響。
+只有設為 `1` 才允許在供應商拒絕簽章時，於同模型／同 owner 下移除回放思考，必要時關閉該輪 thinking。這是有損處理，header 與最終 response 會報告 `thinking_history_dropped` 或 `thinking_disabled_for_turn`。`RESPONSES_STRIP_SIG_ON_ACCOUNT_SWITCH` 的舊設定不能繞過已認證 owner 的帳號選擇約束；即使開啟 fallback，也不能在原帳號不可用時把這份歷史送往其他帳號。
 
 ## Codex 設定與驗證界線
 

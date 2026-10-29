@@ -193,6 +193,7 @@ async def select_credential(
     session_key: Optional[str] = None,
     mode: str = "random",
     preferred: Optional[str] = None,
+    required_account_hash: Optional[str] = None,
 ) -> Tuple[Optional[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
     """
     返回 ((email, credential_data) | None, info)
@@ -200,6 +201,15 @@ async def select_credential(
     preferred: 会话亲和 / sticky 账号（仅在 ready 集合中才会被优先使用）
     """
     ready, cooling, eligible = await classify(model_name)
+    if required_account_hash:
+        from src.responses.encrypted import account_hash
+        # Affinity is merely a preference. Authenticated replay ownership is a
+        # hard boundary, including when the binding expired or points elsewhere.
+        eligible = [email for email in eligible if account_hash(email) == required_account_hash]
+        ready = [email for email in ready if email in eligible]
+        cooling = [(email, until) for email, until in cooling if email in eligible]
+        if not ready:
+            return None, {"reason": "replay_account_unavailable"}
     if not eligible:
         return None, {"reason": "not_available"}
     if not ready:
@@ -224,8 +234,19 @@ async def select_credential(
     return None, {"reason": "no_token"}
 
 
-async def no_credential_response(model_name: str) -> Response:
+async def no_credential_response(model_name: str, required_account_hash: Optional[str] = None) -> Response:
     """select_credential 返回 None 时构造清晰错误（不做任何降级/换模型）。"""
+    if required_account_hash:
+        return Response(
+            content=json.dumps({"error": {
+                "code": "state_account_unavailable",
+                "message": "The authenticated replay account cannot currently serve this exact model; "
+                           "retry when the original account is available or start a new conversation. "
+                           "Replay history was not sent to another account.",
+                "status": "FAILED_PRECONDITION",
+            }}),
+            status_code=409, media_type="application/json",
+        )
     ready, cooling, eligible = await classify(model_name)
     if not eligible:
         code, status = 404, "NOT_FOUND"

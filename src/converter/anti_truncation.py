@@ -443,6 +443,7 @@ class AntiTruncationStreamProcessor:
         original_request_func,
         payload: Dict[str, Any],
         max_attempts: int = 3,
+        aggregate_usage: bool = False,
     ):
         self.original_request_func = original_request_func
         # 深拷贝 request/contents/messages：本类在续传时会向其中追加内容，
@@ -454,6 +455,8 @@ class AntiTruncationStreamProcessor:
         # 整个请求期间是否有文本实时透传给客户端
         # （异常兜底时判断 salvaged 文本是否已发过，避免重发）
         self.forwarded_any_text = False
+        self.aggregate_usage = aggregate_usage
+        self._attempt_usage: Dict[int, Dict[str, int]] = {}
 
     def _get_collected_text(self) -> str:
         """获取收集的文本内容"""
@@ -470,6 +473,54 @@ class AntiTruncationStreamProcessor:
         self.collected_content = io.StringIO()
 
     async def process_stream(self) -> AsyncGenerator[bytes, None]:
+        """Optionally emit one complete usage total across continuation attempts.
+
+        Raw per-attempt counters are withheld in this mode: after an attempt
+        with missing counters, a later successful attempt is not a full total.
+        Other protocol adapters retain their existing streaming behavior.
+        """
+        source = self._process_stream()
+        failed = False
+        try:
+            async for chunk in source:
+                if not self.aggregate_usage or isinstance(chunk, FastAPIResponse):
+                    yield chunk
+                    continue
+                text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+                if text.strip() == "data: [DONE]":
+                    if not failed:
+                        complete = all(
+                            "totalTokenCount" in self._attempt_usage.get(attempt, {})
+                            for attempt in range(1, self.current_attempt + 1)
+                        )
+                        if complete and self.current_attempt:
+                            snapshots = list(self._attempt_usage.values())
+                            # Only sum fields provided by every attempt. Missing
+                            # per-attempt usage never silently counts as zero.
+                            keys = set.intersection(*(set(item) for item in snapshots))
+                            usage = {key: sum(item[key] for item in snapshots) for key in keys}
+                            final = {"usageMetadata": usage}
+                        else:
+                            final = {"x_agy_usage_incomplete": True}
+                        yield f"data: {json.dumps(final)}\n\n".encode("utf-8")
+                    yield chunk
+                    continue
+                try:
+                    data = json.loads(text.strip()[6:]) if text.startswith("data: ") else None
+                except (ValueError, TypeError):
+                    data = None
+                if isinstance(data, dict):
+                    inner = data.get("response", data)
+                    if isinstance(inner, dict):
+                        failed = failed or bool(inner.get("error"))
+                        if "usageMetadata" in inner:
+                            inner.pop("usageMetadata")
+                            chunk = f"data: {json.dumps(data)}\n\n".encode("utf-8")
+                yield chunk
+        finally:
+            await close_async_iterator(source)
+
+    async def _process_stream(self) -> AsyncGenerator[bytes, None]:
         """处理流式响应，检测并处理截断"""
 
         while self.current_attempt < self.max_attempts:
@@ -585,6 +636,20 @@ class AntiTruncationStreamProcessor:
                             yield line
                             continue
 
+                        if self.aggregate_usage:
+                            inner = data.get("response", data)
+                            usage = inner.get("usageMetadata")
+                            if isinstance(usage, dict):
+                                # Within one attempt these are cumulative
+                                # snapshots, not deltas; replace each counter.
+                                counters = {
+                                    key: value for key, value in usage.items()
+                                    if key.endswith("TokenCount")
+                                    and isinstance(value, int) and not isinstance(value, bool)
+                                    and value >= 0
+                                }
+                                self._attempt_usage.setdefault(self.current_attempt, {}).update(counters)
+
                         # 回传前把真实 thoughtSignature 替换为跳过校验占位符，
                         # 替换后重算 line，保证后续原样透传分支也携带脱敏数据
                         if _replace_thought_signatures(data):
@@ -670,6 +735,17 @@ class AntiTruncationStreamProcessor:
                                         stripped, separators=(",", ":"), ensure_ascii=False
                                     )
                                     yield f"data: {json_str}\n\n".encode("utf-8")
+                                else:
+                                    # Usage may arrive separately after STOP. Preserve
+                                    # an actual usage-only event, without forwarding
+                                    # suppressed text/tools or inventing completion.
+                                    inner = data.get("response", data)
+                                    if (
+                                        isinstance(inner.get("usageMetadata"), dict)
+                                        and not inner.get("candidates")
+                                        and not inner.get("error")
+                                    ):
+                                        yield line
                                 continue
                             else:
                                 # 模型未走合成工具、直接输出普通文本：

@@ -37,6 +37,11 @@ _STREAM_TOOL_INDEX: "OrderedDict[str, int]" = OrderedDict()
 _STREAM_TOOL_INDEX_MAX_ENTRIES = 512
 
 
+def release_openai_stream_state(response_id: str) -> None:
+    """Release per-stream tool numbering after completion, failure or cancellation."""
+    _STREAM_TOOL_INDEX.pop(response_id, None)
+
+
 def _next_stream_tool_call_indices(response_id: str, count: int) -> List[int]:
     """为本 chunk 内的 count 个工具调用分配连续的流内序号。"""
     base = _STREAM_TOOL_INDEX.get(response_id, 0)

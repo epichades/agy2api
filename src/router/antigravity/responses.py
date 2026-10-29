@@ -102,6 +102,13 @@ async def _upstream_error(resp: Response, model: str, headers: Dict[str, str],
         h = dict(headers)
         h["Retry-After"] = str(await _retry_after(model))
         return _error_json(429, msg, "rate_limit_exceeded", "rate_limit_exceeded", None, h)
+    if status == 409:
+        try:
+            replay_code = json.loads(_body_text(resp)).get("error", {}).get("code")
+        except (ValueError, AttributeError):
+            replay_code = None
+        if replay_code == "state_account_unavailable":
+            return _error_json(409, msg, "invalid_request_error", replay_code, "input", headers)
     if status in (401, 403):
         # upstream account credential problem, not the client's API key
         return _error_json(502, f"upstream account authorization failed ({status}): {msg}", "server_error",
@@ -136,6 +143,11 @@ async def create_response(request: Request, _token: str = Depends(authenticate_b
     state: Dict[str, Any] = {"account": None}
     session_key = pck_session_key(conv.real_model, conv.prompt_cache_key)
     owners = list(conv.replay.values()) + list(conv.signed_calls.values())
+    owner_hashes = {part["a"] for part in owners}
+    if len(owner_hashes) > 1:
+        return _error_json(400, "Replay history contains different authenticated account owners",
+                           "invalid_request_error", "state_account_mismatch", "input")
+    required_account_hash = next(iter(owner_hashes), None)
 
     def on_credential(email: str, final_payload: Dict[str, Any]) -> None:
         state["account"] = email
@@ -186,7 +198,8 @@ async def create_response(request: Request, _token: str = Depends(authenticate_b
 
     def stream(payload):
         return stream_request(body=payload, native=False, log_ctx=log_ctx,
-                              session_key_override=session_key, on_credential=on_credential)
+                              session_key_override=session_key, on_credential=on_credential,
+                              required_account_hash=required_account_hash)
 
     first_payload = apply_anti_truncation(api_request) if conv.stream and conv.use_anti_truncation else api_request
     upstream = None

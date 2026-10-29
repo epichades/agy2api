@@ -33,7 +33,7 @@ TOKEN_LITERAL = re.compile(
     r"\b(?:access_token|refresh_token)[\"']?\s*[:=]\s*([\"'])([^\"'\r\n]{16,})\1", re.I
 )
 SYNTHETIC = re.compile(r"^(?:synthetic|fixture|fake|dummy|test)(?:$|[_:.\-])", re.I)
-ENV_PRIVATE_VALUES = {"API_PASSWORD", "PANEL_PASSWORD", "RESPONSES_STATE_KEY", "POSTGRESQL_URI", "REDIS_URL", "PROXY"}
+ENV_PRIVATE_VALUES = {"API_PASSWORD", "PANEL_PASSWORD", "RESPONSES_STATE_KEY", "LOG_ACCOUNT_TAG_KEY", "POSTGRESQL_URI", "REDIS_URL", "PROXY"}
 FIXTURE_SIGNATURE_KEYS = {"signature", "thoughtsignature", "encryptedcontent"}
 FIXTURE_ID_KEYS = {"requestid", "responseid", "traceid", "callid", "conversationid"}
 

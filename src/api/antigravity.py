@@ -25,6 +25,7 @@ from log import log
 from src.credential_manager import (
     add_credential,
     get_valid_credential,
+    remember_validated_credential,
 )
 from src.httpx_client import stream_post_async, post_async
 from src.router.stream_passthrough import close_async_iterator
@@ -323,6 +324,7 @@ async def stream_request(
     log_ctx: Optional[Dict[str, Any]] = None,
     session_key_override: Optional[str] = None,  # [local patch responses]
     on_credential: Optional[Callable[[str, Dict[str, Any]], None]] = None,  # [local patch responses]
+    required_account_hash: Optional[str] = None,
 ):
     """
     流式请求函数
@@ -346,7 +348,8 @@ async def stream_request(
 
     # 1. 获取有效凭证
     cred_result = await get_valid_credential(
-        model_name=model_name, session_key=session_key
+        model_name=model_name, session_key=session_key,
+        required_account_hash=required_account_hash, update_affinity=False,
     )
 
     if not cred_result:
@@ -357,7 +360,7 @@ async def stream_request(
             "error_message": "当前无可用凭证", "use_time": time.time() - log_start_time,
         })
         await record_usage_log(log_entry)
-        yield await no_credential_response(model_name)  # [local patch] 404/429 而非 500
+        yield await no_credential_response(model_name, required_account_hash)  # exact model / replay owner
         return
 
     current_file, credential_data = cred_result
@@ -404,7 +407,8 @@ async def stream_request(
     async def refresh_credential_fast():
         nonlocal current_file, access_token, auth_headers, project_id, final_payload
         cred_result = await get_valid_credential(
-            model_name=model_name, session_key=session_key
+            model_name=model_name, session_key=session_key,
+            required_account_hash=required_account_hash, update_affinity=False,
         )
         if not cred_result:
             return None
@@ -433,8 +437,14 @@ async def stream_request(
         # Authorization of replay state is a precondition for EVERY transport.
         # Keep callback failures outside recovery: switching credentials must
         # never turn an account mismatch into an ordinary transport retry.
+        if required_account_hash:
+            from src.responses.encrypted import account_hash
+            if account_hash(current_file) != required_account_hash:
+                yield await no_credential_response(model_name, required_account_hash)
+                return
         if on_credential:
             on_credential(current_file, final_payload)
+        await remember_validated_credential(current_file, session_key)
         received_data = False  # 一旦交付上游数据，禁止重送整个请求
         result_recorded = False
         upstream_iterator = None
@@ -606,7 +616,7 @@ async def stream_request(
                 if not switched:
                     # 换凭证失败，本次未调用谷歌 API，不产生日志
                     log.error("[ANTIGRAVITY STREAM] 重试时无可用凭证或令牌")
-                    yield await no_credential_response(model_name)  # [local patch]
+                    yield await no_credential_response(model_name, required_account_hash)
                     return
                 continue  # 重试
 

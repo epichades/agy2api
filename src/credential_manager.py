@@ -32,6 +32,8 @@ def _reset_sticky() -> None:
 async def get_valid_credential(
     model_name: Optional[str] = None,
     session_key: Optional[str] = None,
+    required_account_hash: Optional[str] = None,
+    update_affinity: bool = True,
 ) -> Optional[Tuple[str, Dict[str, Any]]]:
     """
     获取可用凭证：按凭证选择模式选取，自动跳过禁用/冷却凭证。
@@ -42,11 +44,15 @@ async def get_valid_credential(
     - cache:  会话缓存匹配——session_key 命中绑定时复用该凭证（prompt cache 亲和）
     - sticky: 粘性——尽量保持同一凭证直到其进入 CD 或被禁用
 
+    required_account_hash: authenticated replay owner; never replace with a
+    foreign account even when ordinary affinity has expired or is unavailable.
+    update_affinity: callers with additional validation defer binding until
+    remember_validated_credential, so rejected selections cannot poison cache.
+
     Returns:
         (email, credential_data) 或 None
     """
     global _sticky_email
-    database = await get_database()
     mode = await get_credential_select_mode()
 
     # [local patch] 指定模型时走精确模型路由：只选实时模型列表包含该精确 ID 且未冷却的账号，
@@ -60,13 +66,19 @@ async def get_valid_credential(
         elif mode == "sticky":
             preferred = _sticky_email
         result, _info = await select_credential(
-            model_name, session_key=session_key, mode=mode, preferred=preferred
+            model_name, session_key=session_key, mode=mode, preferred=preferred,
+            required_account_hash=required_account_hash,
         )
-        if result:
+        if result and update_affinity:
             await _after_picked(mode, result[0], session_key)
-        elif mode == "cache" and session_key and preferred:
+        elif not result and update_affinity and mode == "cache" and session_key and preferred:
             await session_cache.delete_session_binding(session_key)
         return result
+
+    # Authenticated history must never enter the unrestricted legacy selector.
+    if required_account_hash:
+        return None
+    database = await get_database()
 
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
@@ -115,14 +127,16 @@ async def get_valid_credential(
             log.debug(f"Token需要刷新: {email}")
             refreshed = await refresh_token(credential_data, email)
             if refreshed:
-                await _after_picked(mode, email, session_key)
+                if update_affinity:
+                    await _after_picked(mode, email, session_key)
                 return email, refreshed
             log.warning(
                 f"Token刷新失败，尝试下一个凭证: {email} (attempt={attempt + 1}/{max_retries})"
             )
             continue
 
-        await _after_picked(mode, email, session_key)
+        if update_affinity:
+            await _after_picked(mode, email, session_key)
         return email, credential_data
 
     log.error(f"重试{max_retries}次后仍无可用凭证 (model_name={model_name})")
@@ -151,6 +165,11 @@ async def _after_picked(mode: str, email: str, session_key: Optional[str]) -> No
             _sticky_email = email
     except Exception as e:
         log.debug(f"记录凭证亲和失败（不影响请求）: {e}")
+
+
+async def remember_validated_credential(email: str, session_key: Optional[str]) -> None:
+    """Commit affinity only after the caller's replay/account checks succeed."""
+    await _after_picked(await get_credential_select_mode(), email, session_key)
 
 
 # ====================== 凭证增删改 ======================

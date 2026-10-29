@@ -16,7 +16,69 @@
 
 `pyproject.toml`＋`uv.lock` 鎖定相依，`.python-version` 指定 Python 3.13。`requirements.lock` 是相同 lock 匯出的 production 版本與 hashes，供 pip／Docker 使用。正式 pip 安裝加 `--require-hashes`；`requirements.txt` 只作下限宣告，不作可重現的正式安裝來源。
 
-啟動腳本用 `uv sync --locked --no-dev`，不更新 Git，也不偷偷重新解析版本。manifest 改動後應重新產生／驗證／發布 lock；程序重啟不應執行更新。`restart.sh` 相對自身目錄啟動已安裝 venv；`loop.sh` 是需 Linux flock 的前景 supervisor、先建 data 再鎖定、log 送 stdout。有 systemd 時勿同時啟動 loop。
+啟動腳本用 `uv sync --locked --no-dev`，不更新 Git，也不偷偷重新解析版本。manifest 改動後應重新產生／驗證／發布 lock；程序重啟不應執行更新。`start.sh` 安裝相依後進入 `loop.sh`；後者是 POSIX 前景 supervisor，使用 Python 的 flock 與私有 Unix socket，log 送 stdout，不需外部 `flock` 命令。有 systemd／Docker 時應使用其服務管理方式，勿同時啟動 loop。
+
+`GET /version/info` 保留原有上游版本欄位，另外提供 `build.commit`、`build.source`、`build.dirty`。有 Git checkout 時在程序啟動匯入時取得實際 commit；archive／容器可由部署程序注入已核對的 `AGY_BUILD_SHA`（完整 40 或 64 字元十六進位 hash）。缺少這兩種資訊時 `build.commit=null`，不能拿 `version.txt` 當成修正版的 SHA。設定值只作部署識別，仍需比對發布產物及啟動位置。
+
+## 使用 loop 的受管啟停
+
+先以舊有管理方式停止舊版 supervisor 及所有服務寫入程序，確認原埠釋放，再改用新版。只殺舊 loop 的 web 子程序會被自動拉起；新版不會猜測或按埠殺掉未知程序。
+
+```bash
+# 首次以前景啟動；由操作平台保持此程序存活。
+./start.sh
+# 已安裝 locked 相依時可直接 ./loop.sh。
+
+# 另一個終端控制同一 checkout；不讀取／執行 .env shell code。
+.venv/bin/python scripts/service_control.py status
+./restart.sh
+.venv/bin/python scripts/service_control.py stop
+```
+
+`restart.sh` 現在只向已存在的受管 supervisor 發送重啟命令；沒有 supervisor 時明確失敗，不會偷偷再起一份占用 7861 的程序。控制器只向自己建立的 child process group 發信號，先 TERM、等待最多 20 秒，必要時 KILL，舊 child 退出後才啟動新的。`stop` 等待 supervisor socket 關閉才成功；它不使用可被陳舊內容誤導的 PID 檔。
+
+狀態目錄預設 `data/service-state`，須為目前服務使用者擁有、權限 700 的普通目錄，socket 為 600。可對上述命令一致傳入 `--state-dir /private/service-state`；Unix socket 路徑過長時需使用較短路徑。`--stop-timeout` 可調整優雅停止時間，`--restart-delay` 預設 5 秒。一次只能有一個 supervisor；不要對 supervisor 使用 SIGKILL，因為不可捕獲的信號無法保證清理 child。
+
+重啟回覆只表示程序已替換，`readiness_checked=false`；還需檢查 `/health/ready`、`/version/info` 的 build commit，以及實際客戶端文字／工具回放。失敗設定可能持續重新啟動，應先 stop，再修正或按下節還原。
+
+## 升級前私有快照與回滾
+
+`scripts/deployment_snapshot.py` 必須以**實際部署**的路徑使用，不預設資料都在 `data/`。先停掉真正的 supervisor／所有 DB 寫入程序，核對 DB 類型、`CREDENTIALS_DIR`、私密環境設定來源，才可使用 `--service-stopped`。此旗標是操作者的確認，工具無法替外部 systemd／Docker 證明服務已停止。
+
+```bash
+# backup 父目錄先建立，output 必須不存在且位於所有來源目錄之外。
+install -d -m 700 /var/backups/agy2api
+python3 scripts/deployment_snapshot.py create \
+  --project /opt/agy2api \
+  --credentials-dir /opt/agy2api/data/creds \
+  --env-file /opt/agy2api/.env \
+  --database sqlite --service-stopped \
+  --output /var/backups/agy2api/preupgrade-EXAMPLE
+python3 scripts/deployment_snapshot.py verify \
+  --snapshot /var/backups/agy2api/preupgrade-EXAMPLE
+```
+
+快照包含完整舊 checkout（包含既有 `.venv`）、實際憑證目錄、指定的外部私密環境檔與 manifest；SQLite 另以 backup API 產生通過 quick_check 的獨立 `credentials.sqlite`，避免只複製主 DB 漏掉 WAL 資料。輸出目錄 700、檔案 600，成功前不建立完整 manifest；checksum 檢查失敗不得使用。快照可能含原始私密 Git 歷史、帳密與對話，絕不可上傳 GitHub；checksum 不是加密，仍需私密存放及離機加密備份。
+
+若狀態金鑰／設定只在服務管理器或程序環境，須先在受保護檔案保存，並追加 `--env-file`。Docker named volumes 及 PostgreSQL 需用各自管理方式停止／備份；PostgreSQL 模式要求 `--database postgresql --external-database-backup /private/database.dump`，工具只驗證檔案快照，不驗證 PostgreSQL dump 是否能還原。不能因為備份了本機目錄就宣稱外部 DB 已備份。
+
+回滾先停止新版並保存其新寫入，再把舊快照還原到**全新 staging 目錄**：
+
+```bash
+python3 scripts/deployment_snapshot.py restore \
+  --snapshot /var/backups/agy2api/preupgrade-EXAMPLE \
+  --destination /var/backups/agy2api/rollback-stage-EXAMPLE
+```
+
+restore 只建立 staging，不覆寫 live checkout／資料庫。依私密 manifest 將舊程式、舊 `.venv`、設定、憑證和金鑰作為同一組恢復；SQLite 使用獨立 `credentials.sqlite` 覆蓋恢復目錄中的 `credentials.db`，並移除**恢復目錄內**原始 `credentials.db-wal`／`credentials.db-shm`，不能把舊 WAL 套到獨立快照。保留目前新版資料直到確認舊版驗收成功，不把遷移後新 DB 直接交給舊程式。venv 的 interpreter symlink 可能指向同主機外部 Python；跨主機／更換 Python 時須以舊 lock 重建環境。
+
+操作次序是：準備新 release 與 locked 相依 → 停止舊 supervisor／寫入 → 完成並驗證快照 → 切換程式及單一服務 → readiness／build SHA／認證與實際客戶端驗收；失敗則停止新版、保存新寫入、還原匹配快照、啟動舊版並重新驗收。這兩個工具不會自動啟用 systemd、變更反代或猜測 7861 的現場程序。
+
+## 管理腳本的登入遷移
+
+模型端點繼續使用 `API_PASSWORD`；只有管理端點改用八小時面板 session token。管理腳本應 `POST /auth/login`，JSON body 為 `{"password": PANEL_PASSWORD}`，將回傳 `token` 用於後續 `Authorization: Bearer ...`。401 時清除舊 token、重新登入一次並重試；第二次失敗就停止，不做無限登入循環。輪替面板密碼也會使舊 token 失效。
+
+請從私密環境／受控檔案讀取密碼，在記憶體中送出並保存 token，不將真值放進命令列參數、URL、終端輸出或原始碼。前端已有 session token 流程；這項遷移不需要恢復「直接接受面板密碼當 Bearer」的舊行為。
 
 ## 私有 `.env`
 

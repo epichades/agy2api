@@ -11,6 +11,8 @@
 - set_log_level 动态调整级别，get_log_level 读取当前级别
 """
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -41,13 +43,14 @@ _SECRET_PATTERNS = [
     (re.compile(r"(?i)(bearer\s+)[^\s,;\"'<>]+"), r"\1***"),
     (re.compile(r"ya29\.[A-Za-z0-9._\-]+"), "ya29.***"),
     (re.compile(r"1//[A-Za-z0-9._\-]{20,}"), "1//***"),
-    (re.compile(r"(?i)(['\"]?(?:access_token|refresh_token|id_token|client_secret|api_key|password|authorization)['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}&#;]+"), r"\1***"),
+    (re.compile(r"(?i)(['\"]?(?:access_token|refresh_token|id_token|client_secret|api_key|password|authorization|responses_state_key|log_account_tag_key)['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}&#;]+"), r"\1***"),
 ]
 
 _QUERY_VALUE_RE = re.compile(r"([?&;])([^=?&#\s\"'<>]+)=([^\r\n&#<>]*)")
 _PRIVATE_QUERY_NAMES = {
     "key", "apikey", "token", "accesstoken", "refreshtoken", "idtoken",
     "clientsecret", "password", "authorization", "code", "state", "signature",
+    "responsesstatekey", "logaccounttagkey",
 }
 
 
@@ -104,6 +107,24 @@ _EMAIL_RE = re.compile(
 )
 
 
+def _account_marker(match) -> str:
+    # An independent, operator-owned key enables correlation without exposing
+    # email addresses or allowing public dictionary guesses from a plain hash.
+    value = match.group(0)
+    # The broad privacy matcher also consumes '=' (legal in email local parts).
+    # Recognize our diagnostic field labels so their spelling does not change
+    # the account tag. Other unusual local parts remain intact and masked.
+    label = re.match(r"(?i)^(account|email|credential|credential_email)=", value)
+    prefix = label.group(0) if label else ""
+    value = value[len(prefix):]
+    key = os.getenv("LOG_ACCOUNT_TAG_KEY", "").encode("utf-8")
+    if len(key) < 32:
+        return prefix + "[email]"
+    value = value.casefold().encode("utf-8")
+    digest = hmac.new(key, b"agy2api-log-account-v1\x00" + value, hashlib.sha256)
+    return prefix + "[account:" + digest.hexdigest()[:16] + "]"
+
+
 def _redact_message(message: str) -> str:
     def redact_authority(match):
         scheme, authority = match.groups()
@@ -114,7 +135,7 @@ def _redact_message(message: str) -> str:
         return f"{scheme}[redacted]@{host}"
 
     message = _URL_AUTHORITY_RE.sub(redact_authority, str(message))
-    return _EMAIL_RE.sub("[email]", message)
+    return _EMAIL_RE.sub(_account_marker, message)
 
 
 def _refresh_config():

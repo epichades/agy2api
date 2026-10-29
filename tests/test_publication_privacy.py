@@ -104,7 +104,7 @@ def test_public_oauth_client_constants_and_synthetic_fixture_allowed(repository)
         'ANTIGRAVITY_CLIENT_ID = "public-client.apps.googleusercontent.com"\n'
         'ANTIGRAVITY_CLIENT_SECRET = "GOCSPX-public-cli-client-constant"\n'
     )
-    (repository / ".env.example").write_text("API_PASSWORD=\nPANEL_PASSWORD=\nRESPONSES_STATE_KEY=\n")
+    (repository / ".env.example").write_text("API_PASSWORD=\nPANEL_PASSWORD=\nRESPONSES_STATE_KEY=\nLOG_ACCOUNT_TAG_KEY=\n")
     fixture = repository / "tests" / "fixtures" / "synthetic.sse"
     fixture.parent.mkdir(parents=True)
     fixture.write_text("data: " + json.dumps({"response": {
@@ -116,6 +116,16 @@ def test_public_oauth_client_constants_and_synthetic_fixture_allowed(repository)
     result = run(repository, "--base", "base")
     assert result.returncode == 0, result.stdout
     assert result.stdout.startswith("PASS")
+
+
+def test_account_tag_key_must_not_be_filled_in_public_example(repository):
+    value = "private-config-value-not-for-publication"
+    (repository / ".env.example").write_text("LOG_ACCOUNT_TAG_KEY=" + value + "\n")
+    commit(repository)
+    result = run(repository, "--base", "base")
+    assert result.returncode == 1
+    assert '.env.example' in result.stdout
+    assert value not in result.stdout
 
 
 @pytest.mark.parametrize("field,category", [
