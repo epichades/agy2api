@@ -34,8 +34,6 @@ def extract_content_and_reasoning(parts: list) -> tuple:
 
         # 提取文本内容
         text = part.get("text", "")
-        if is_internal_placeholder_text(text):
-            continue
         if text:
             if part.get("thought", False):
                 reasoning_content += text
@@ -76,15 +74,15 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
         system_parts = []
 
         if isinstance(system_content, str):
-            if system_content.strip():
+            if system_content:
                 system_parts.append({"text": system_content})
         elif isinstance(system_content, list):
             # system 可以是包含多个块的列表
             for item in system_content:
                 if isinstance(item, dict):
-                    if item.get("type") == "text" and item.get("text", "").strip():
+                    if item.get("type") == "text" and item.get("text", ""):
                         system_parts.append({"text": item["text"]})
-                elif isinstance(item, str) and item.strip():
+                elif isinstance(item, str) and item:
                     system_parts.append({"text": item})
 
         if system_parts:
@@ -118,15 +116,15 @@ async def merge_system_messages(request_body: Dict[str, Any]) -> Dict[str, Any]:
         if role in instruction_roles and collecting_system:
             # 提取 system 消息的文本内容
             if isinstance(content, str):
-                if content.strip():
+                if content:
                     system_parts.append({"text": content})
             elif isinstance(content, list):
                 # 处理列表格式的 content
                 for item in content:
                     if isinstance(item, dict):
-                        if item.get("type") == "text" and item.get("text", "").strip():
+                        if item.get("type") == "text" and item.get("text", ""):
                             system_parts.append({"text": item["text"]})
-                    elif isinstance(item, str) and item.strip():
+                    elif isinstance(item, str) and item:
                         system_parts.append({"text": item})
         else:
             # 遇到非 system 消息，停止收集

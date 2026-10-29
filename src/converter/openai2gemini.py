@@ -5,6 +5,7 @@ OpenAI Transfer Module - Handles conversion between OpenAI and Gemini API format
 
 import base64
 import copy
+import hashlib
 import json
 import re
 import time
@@ -142,7 +143,7 @@ def _normalize_function_name(name: str) -> str:
     1. 中文字符转换为拼音
     2. 将非法字符替换为下划线
     3. 如果以非字母/下划线开头，添加下划线前缀
-    4. 截断到 64 个字符
+    4. 对变更或超长名称附加稳定散列，避免名称碰撞
 
     Args:
         name: 原始函数名
@@ -180,9 +181,11 @@ def _normalize_function_name(name: str) -> str:
         # 以数字、点或短横线开头，添加下划线前缀
         normalized = "_" + normalized
 
-    # 步骤4：截断到 64 个字符
-    if len(normalized) > 64:
-        normalized = normalized[:64]
+    # Keep names deterministic across declarations, tool choice and history. A
+    # simple truncation (or punctuation replacement) aliases distinct tools.
+    if normalized != name or len(normalized) > 64:
+        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+        normalized = normalized[:47] + "_" + digest
 
     # 步骤5：确保不为空
     if not normalized:
@@ -840,11 +843,11 @@ def fix_tool_call_args_types(
                         # 尝试转换为 float，如果是整数则保持为 int
                         num_value = float(value)
                         fixed_args[key] = int(num_value) if num_value.is_integer() else num_value
-                    log.debug(f"[OPENAI2GEMINI] 修正参数类型: {key} '{value}' -> {fixed_args[key]} ({param_type})")
+                    log.debug("[OPENAI2GEMINI] 已依 schema 修正参数类型")
                 except (ValueError, AttributeError):
                     # 转换失败，保持原样
                     fixed_args[key] = value
-                    log.warning(f"[OPENAI2GEMINI] 无法将参数 {key} 的值 '{value}' 转换为 {param_type}")
+                    log.warning("[OPENAI2GEMINI] 参数类型不符合 schema，保留原值")
             else:
                 fixed_args[key] = value
         elif param_type == "boolean":
@@ -857,14 +860,14 @@ def fix_tool_call_args_types(
                 else:
                     fixed_args[key] = value
                 if fixed_args[key] != value:
-                    log.debug(f"[OPENAI2GEMINI] 修正参数类型: {key} '{value}' -> {fixed_args[key]} (boolean)")
+                    log.debug("[OPENAI2GEMINI] 已依 schema 修正 boolean 类型")
             else:
                 fixed_args[key] = value
         elif param_type == "string":
             # 如果值不是字符串，转换为字符串
             if not isinstance(value, str):
                 fixed_args[key] = str(value)
-                log.debug(f"[OPENAI2GEMINI] 修正参数类型: {key} {value} -> '{fixed_args[key]}' (string)")
+                log.debug("[OPENAI2GEMINI] 已依 schema 修正 string 类型")
             else:
                 fixed_args[key] = value
         else:
@@ -988,65 +991,13 @@ def convert_tool_choice_to_tool_config(
 
 
 def _reverse_transform_value(value: Any) -> Any:
-    """
-    将值转换回原始类型（Gemini 可能将所有值转为字符串）
-
-    仅处理 Gemini 在工具参数中常见的布尔/空值字符串化情况，
-    不再对数字字符串做启发式转换，避免把 schema 声明为 string
-    的参数错误还原成 integer。
-    
-    参考 worker.mjs 的 reverseTransformValue
-    
-    Args:
-        value: 要转换的值
-        
-    Returns:
-        转换后的值
-    """
-    if not isinstance(value, str):
-        return value
-    
-    # 布尔值
-    if value == 'true':
-        return True
-    if value == 'false':
-        return False
-    
-    # null
-    if value == 'null':
-        return None
-    
-    # 其他情况保持字符串
+    """Preserve JSON types; a string literal is not evidence of a bool/null."""
     return value
 
 
 def _reverse_transform_args(args: Any) -> Any:
-    """
-    递归转换函数参数，将字符串转回原始类型
-    
-    参考 worker.mjs 的 reverseTransformArgs
-    
-    Args:
-        args: 函数参数（可能是字典、列表或其他类型）
-        
-    Returns:
-        转换后的参数
-    """
-    if not isinstance(args, (dict, list)):
-        return args
-    
-    if isinstance(args, list):
-        return [_reverse_transform_args(item) for item in args]
-    
-    # 处理字典
-    result = {}
-    for key, value in args.items():
-        if isinstance(value, (dict, list)):
-            result[key] = _reverse_transform_args(value)
-        else:
-            result[key] = _reverse_transform_value(value)
-    
-    return result
+    """Return an independent copy without heuristic type coercion."""
+    return copy.deepcopy(args)
 
 
 def extract_tool_calls_from_parts(
@@ -1380,7 +1331,7 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
                         f"name={func_name} args={'partial' if args else 'empty'}"
                     )
 
-                if func_name in tool_schemas:
+                if func_name in tool_schemas and not openai_request.get("_preserve_tool_arguments"):
                     args = fix_tool_call_args_types(args, tool_schemas[func_name])
 
                 original_id, _ = decode_tool_id_and_signature(encoded_id)

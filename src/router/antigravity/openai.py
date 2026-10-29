@@ -81,11 +81,6 @@ async def chat_completions(
     # 转换为字典
     normalized_dict = model_to_dict(openai_request)
 
-    # 健康检查
-    if is_health_check_request(normalized_dict, format="openai"):
-        response = create_health_check_response(format="openai")
-        return JSONResponse(content=response)
-
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(openai_request.model)
     real_model = get_base_model_from_feature_model(openai_request.model)
@@ -110,7 +105,10 @@ async def chat_completions(
     gemini_dict["model"] = real_model
 
     # 规范化 Gemini 请求 (使用 antigravity 模式)
-    gemini_dict = await normalize_antigravity_request(gemini_dict)
+    try:
+        gemini_dict = await normalize_antigravity_request(gemini_dict)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # This endpoint accepts OpenAI roles, but the Antigravity content schema
     # accepts only USER/MODEL. Catch a conversion regression before HTTP send.

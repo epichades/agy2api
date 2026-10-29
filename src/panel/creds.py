@@ -77,7 +77,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             await creds.refresh()
         except Exception as e:
-            return {"status": "error", "message": f"refresh_token 无效: {str(e)[:200]}"}
+            return {"status": "error", "message": "refresh_token 无效或刷新失败"}
 
         if not creds.access_token:
             return {"status": "error", "message": "refresh_token 无效: 未获取到 access_token"}
@@ -87,7 +87,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 email = await get_user_email(creds)
             except Exception as e:
-                log.warning(f"自动获取邮箱失败: {e}")
+                log.warning(f"自动获取邮箱失败: {type(e).__name__}")
         if not email:
             return {"status": "error", "message": "无法获取邮箱（JSON 中未提供且自动获取失败）"}
 
@@ -105,7 +105,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
                 if not tier:
                     tier = fetched_tier
             except Exception as e:
-                log.warning(f"自动获取 project_id/tier 失败: {e}")
+                log.warning(f"自动获取 project_id/tier 失败: {type(e).__name__}")
 
         # project_id 获取失败时回退为 aicode-consumers，避免空值入库
         if not project_id:
@@ -131,7 +131,7 @@ async def _import_single_credential(data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     except Exception as e:
-        return {"status": "error", "message": f"处理失败: {str(e)[:200]}"}
+        return {"status": "error", "message": f"处理失败: {type(e).__name__}"}
 
 
 # =============================================================================
@@ -171,7 +171,7 @@ async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
                         files_data.append({"filename": filename, "content": content_str})
 
                 except Exception as e:
-                    log.warning(f"处理ZIP中的文件 {json_filename} 时出错: {e}")
+                    log.warning(f"处理ZIP中的文件 {json_filename} 时出错: {type(e).__name__}")
                     continue
 
         log.info(f"成功从ZIP文件中提取 {len(files_data)} 个有效的JSON文件")
@@ -182,8 +182,8 @@ async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
     except Exception as e:
         if isinstance(e, HTTPException):
             raise
-        log.error(f"处理ZIP文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"处理ZIP文件失败: {str(e)}")
+        log.error(f"处理ZIP文件失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail=f"处理ZIP文件失败: {type(e).__name__}")
 
 
 async def upload_credentials_common( files: List[UploadFile] ) -> JSONResponse:
@@ -249,13 +249,13 @@ async def upload_credentials_common( files: List[UploadFile] ) -> JSONResponse:
                 return {
                     "filename": file_data["filename"],
                     "status": "error",
-                    "message": f"JSON格式错误: {str(e)}",
+                    "message": f"JSON格式错误: {type(e).__name__}",
                 }
             except Exception as e:
                 return {
                     "filename": file_data["filename"],
                     "status": "error",
-                    "message": f"处理失败: {str(e)[:200]}",
+                    "message": f"处理失败: {type(e).__name__}",
                 }
 
         log.info(f"开始并发处理 {len(batch_files)} 个凭证...")
@@ -368,7 +368,7 @@ async def download_all_creds_common() -> Response:
                 zip_file.writestr(f"{email}.json", content)
                 success_count += 1
             except Exception as e:
-                log.warning(f"导出凭证 {email} 时出错: {e}")
+                log.warning(f"导出凭证 {email} 时出错: {type(e).__name__}")
                 continue
 
     log.info(f"打包完成: 成功 {success_count}/{len(emails)} 个凭证")
@@ -377,7 +377,10 @@ async def download_all_creds_common() -> Response:
     return Response(
         content=zip_buffer.getvalue(),
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={zip_filename}"},
+        headers={
+            "Content-Disposition": f"attachment; filename={zip_filename}",
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -431,7 +434,7 @@ async def verify_credential_project_common(email: str) -> JSONResponse:
 
     await database.update_credential_state(email, state_update)
 
-    log.info(f"检验凭证成功: {email} - Project ID: {project_id}, Tier: {subscription_tier}")
+    log.info("检验凭证成功")
 
     return JSONResponse(content={
         "success": True,
@@ -457,8 +460,8 @@ async def upload_credentials( files: List[UploadFile] = File(...),
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"批量导入失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"批量导入失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.get("/status")
@@ -481,8 +484,8 @@ async def get_creds_status(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"获取凭证状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"获取凭证状态失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.post("/action")
@@ -523,8 +526,8 @@ async def creds_action(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"凭证操作失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"凭证操作失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.post("/batch-action")
@@ -563,8 +566,8 @@ async def creds_batch_action(
                     errors.append(f"{email}: 无效的操作类型")
                     continue
             except Exception as e:
-                log.error(f"处理 {email} 时出错: {e}")
-                errors.append(f"{email}: 处理失败 - {str(e)}")
+                log.error(f"处理 {email} 时出错: {type(e).__name__}")
+                errors.append(f"{email}: 处理失败 - {type(e).__name__}")
                 continue
 
         result_message = f"批量操作完成：成功处理 {success_count}/{len(emails)} 个凭证"
@@ -581,8 +584,8 @@ async def creds_batch_action(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"批量凭证操作失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"批量凭证操作失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.get("/export/{email}")
@@ -611,14 +614,17 @@ async def export_credential(
         return Response(
             content=content,
             media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{email}.json"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{email}.json"',
+                "Cache-Control": "no-store",
+            },
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"导出凭证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"导出凭证失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.get("/download-all")
@@ -630,8 +636,8 @@ async def download_all_creds(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"打包导出失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"打包导出失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.post("/verify-project/{email}")
@@ -644,8 +650,8 @@ async def verify_credential_project(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"检验凭证失败 {email}: {e}")
-        raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
+        log.error(f"检验凭证失败 {email}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail=f"检验失败: {type(e).__name__}")
 
 
 @router.get("/errors/{email}")
@@ -661,8 +667,8 @@ async def get_credential_errors(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"获取凭证错误信息失败 {email}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"获取凭证错误信息失败 {email}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.get("/quota/{email}")
@@ -716,8 +722,8 @@ async def get_credential_quota(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"获取凭证额度失败 {email}: {e}")
-        raise HTTPException(status_code=500, detail=f"获取额度失败: {str(e)}")
+        log.error(f"获取凭证额度失败 {email}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail=f"获取额度失败: {type(e).__name__}")
 
 
 @router.post("/test/{email}")
@@ -805,7 +811,7 @@ async def test_credential(
                     "error_messages": error_messages
                 })
             except Exception as e:
-                log.error(f"保存测试错误信息失败: {e}")
+                log.error(f"保存测试错误信息失败: {type(e).__name__}")
 
         error_text = response.text if hasattr(response, "text") else ""
 
@@ -823,5 +829,5 @@ async def test_credential(
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"测试凭证失败 {email}: {e}")
-        raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")
+        log.error(f"测试凭证失败 {email}: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail=f"测试失败: {type(e).__name__}")

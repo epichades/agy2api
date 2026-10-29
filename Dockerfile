@@ -1,41 +1,33 @@
-# Multi-stage build for agy2api
-FROM python:3.13-slim as base
+# Build this checkout; no credentials or local runtime data enter the image.
+FROM python:3.13-slim
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    TZ=Asia/Shanghai
+    TZ=Asia/Taipei \
+    MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
 
-# Install tzdata, jemalloc and set timezone
-# jemalloc 替代 glibc malloc，大幅减少内存碎片化
+# ld.so's preload file uses the discovered path on both amd64 and arm64.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends tzdata libjemalloc2 && \
-    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime && \
-    echo "Asia/Shanghai" > /etc/timezone && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# 使用 jemalloc 替代 glibc malloc
-# jemalloc 会主动将空闲内存归还给操作系统，避免 RSS 持续增长
-ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
-# jemalloc 配置：启用后台线程回收、脏页衰减时间 5 秒（默认 10 秒）
-ENV MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+    find /usr/lib -name libjemalloc.so.2 -print -quit > /etc/ld.so.preload && \
+    test -s /etc/ld.so.preload && \
+    ln -sf /usr/share/zoneinfo/Asia/Taipei /etc/localtime && \
+    echo "Asia/Taipei" > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd --gid 10001 agy2api && \
+    useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin agy2api
 
 WORKDIR /app
-
-# Copy only requirements first for better caching
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+COPY requirements.lock ./
+RUN pip install --require-hashes -r requirements.lock
 COPY . .
-
-# Expose port
+RUN mkdir -p /app/creds /app/data/request_logs && \
+    chown -R 10001:10001 /app/creds /app/data && \
+    chmod 700 /app/creds /app/data/request_logs
+USER 10001:10001
 EXPOSE 7861
-
-# 通过 web.py 启动，使 HOST/PORT 环境变量生效
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '7861') + '/health/ready', timeout=3)"
 CMD ["python", "web.py"]

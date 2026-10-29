@@ -11,4 +11,6 @@ SQLAlchemy[asyncio]>=2.0.30
 greenlet>=3.0.0
 aiosqlite>=0.20.0
 pypinyin>=0.51.0
-asyncpg
+asyncpg>=0.31.0
+cryptography>=44.0.0
+redis>=5.0.0

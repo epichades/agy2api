@@ -80,11 +80,6 @@ async def generate_content(
     # 转换为字典
     normalized_dict = model_to_dict(gemini_request)
 
-    # 健康检查
-    if is_health_check_request(normalized_dict, format="gemini"):
-        response = create_health_check_response(format="gemini")
-        return JSONResponse(content=response)
-
     # 处理模型名称和功能检测
     use_anti_truncation = is_anti_truncation_model(model)
     real_model = get_base_model_from_feature_model(model)
@@ -97,7 +92,10 @@ async def generate_content(
     normalized_dict["model"] = real_model
 
     # 规范化 Gemini 请求 (使用 antigravity 模式)
-    normalized_dict = await normalize_antigravity_request(normalized_dict)
+    try:
+        normalized_dict = await normalize_antigravity_request(normalized_dict)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # 准备API请求格式 - 提取model并将其他字段放入request中
     api_request = {
@@ -169,7 +167,10 @@ async def stream_generate_content(
     # ========== 流式抗截断生成器 ==========
     async def anti_truncation_generator():
         # 先进行基础标准化
-        normalized_req = await normalize_antigravity_request(normalized_dict.copy())
+        try:
+            normalized_req = await normalize_antigravity_request(normalized_dict.copy())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # 准备API请求格式 - 提取model并将其他字段放入request中
         api_request = {
@@ -250,7 +251,10 @@ async def stream_generate_content(
 
     # ========== 普通流式生成器 ==========
     async def normal_stream_generator():
-        normalized_req = await normalize_antigravity_request(normalized_dict.copy())
+        try:
+            normalized_req = await normalize_antigravity_request(normalized_dict.copy())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         # 准备API请求格式 - 提取model并将其他字段放入request中
         api_request = {
@@ -280,7 +284,7 @@ async def stream_generate_content(
                     error_json = json.loads(error_content.decode('utf-8'))
                 except Exception:
                     error_json = {"error": {"code": chunk.status_code, "message": "upstream error", "status": "ERROR"}}
-                log.error(f"[ANTIGRAVITY STREAM] 返回错误给客户端: status={chunk.status_code}, error={str(error_json)[:200]}")
+                log.error(f"[ANTIGRAVITY STREAM] 返回错误给客户端: status={chunk.status_code}")
                 yield f"data: {json.dumps(error_json)}\n\n".encode('utf-8')
                 yield b"data: [DONE]\n\n"
                 return
@@ -400,7 +404,8 @@ if __name__ == "__main__":
     }
 
     # 测试API密钥（模拟）
-    test_api_key = "pwd"
+    import os
+    test_api_key = os.environ["API_PASSWORD"]
 
     def test_non_stream_request():
         """测试非流式请求"""

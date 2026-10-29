@@ -83,15 +83,21 @@ class OpenAIChatMessage(BaseModel):
 
 
 class OpenAIChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: str
     messages: List[OpenAIChatMessage]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
+    response_format: Optional[Dict[str, Any]] = None
+    n: Optional[int] = None
+    seed: Optional[int] = None
     stream: bool = False
     tools: Optional[List[OpenAITool]] = None
     tool_choice: Optional[Any] = None
-    stop: Optional[List[str]] = None
+    stop: Optional[str | List[str]] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     user: Optional[str] = None
@@ -179,16 +185,20 @@ class ClaudeContentBlock(BaseModel):
     name: Optional[str] = None
     input: Optional[Dict[str, Any]] = None
     source: Optional[Dict[str, Any]] = None
-    thinking: Optional[Dict[str, Any]] = None
+    thinking: Optional[str] = None
     signature: Optional[str] = None
 
 
 class ClaudeMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
     content: Any
 
 
 class ClaudeTool(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None

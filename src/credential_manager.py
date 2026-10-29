@@ -49,6 +49,25 @@ async def get_valid_credential(
     database = await get_database()
     mode = await get_credential_select_mode()
 
+    # [local patch] 指定模型时走精确模型路由：只选实时模型列表包含该精确 ID 且未冷却的账号，
+    # 亲和（cache/sticky）仅在亲和账号属于合格集合时生效；绝不换模型。
+    if model_name:
+        from src.api.antigravity_routing import select_credential
+
+        preferred = None
+        if mode == "cache" and session_key:
+            preferred = await session_cache.get_session_binding(session_key)
+        elif mode == "sticky":
+            preferred = _sticky_email
+        result, _info = await select_credential(
+            model_name, session_key=session_key, mode=mode, preferred=preferred
+        )
+        if result:
+            await _after_picked(mode, result[0], session_key)
+        elif mode == "cache" and session_key and preferred:
+            await session_cache.delete_session_binding(session_key)
+        return result
+
     # cache 模式：先查会话绑定
     if mode == "cache" and session_key:
         bound_email = await session_cache.get_session_binding(session_key)
@@ -196,6 +215,12 @@ async def record_api_call_result(
         if success:
             asyncio.create_task(database.record_success(email, model_name=model_name))
         elif error_code:
+            # [local patch] 429/503 无明确冷却时间时设短暂内存冷却，便于重试切到同模型的其它账号
+            try:
+                from src.api.antigravity_routing import note_error
+                note_error(email, model_name, error_code, cooldown_until)
+            except Exception as _e:
+                log.debug(f"note_error failed: {_e}")
             error_messages = {}
             if error_message:
                 error_messages[str(error_code)] = error_message

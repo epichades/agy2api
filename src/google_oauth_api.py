@@ -117,7 +117,8 @@ class Credentials:
             else:
                 error_msg = f"Token刷新失败: {error_msg}"
 
-            log.error(error_msg)
+            log.error(f"Token刷新失败: {type(e).__name__}"
+                      + (f" (HTTP {status_code})" if status_code else ""))
             token_error = TokenError(error_msg)
             token_error.status_code = status_code
             raise token_error
@@ -138,7 +139,7 @@ class Credentials:
                     else:
                         expires_at = datetime.fromisoformat(expiry_str).replace(tzinfo=timezone.utc)
             except ValueError:
-                log.warning(f"无法解析过期时间: {expiry_str}")
+                log.warning("无法解析过期时间")
 
         return cls(
             access_token=data.get("token") or data.get("access_token", ""),
@@ -240,7 +241,7 @@ class Flow:
 
         except Exception as e:
             error_msg = f"获取token失败: {str(e)}"
-            log.error(error_msg)
+            log.error(f"获取token失败: {type(e).__name__}")
             raise TokenError(error_msg)
 
 
@@ -312,7 +313,7 @@ class ServiceAccount:
 
         except Exception as e:
             error_msg = f"Service Account获取token失败: {str(e)}"
-            log.error(error_msg)
+            log.error(f"Service Account获取token失败: {type(e).__name__}")
             raise TokenError(error_msg)
 
     @classmethod
@@ -340,7 +341,7 @@ async def get_user_info(credentials: Credentials) -> Optional[Dict[str, Any]]:
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        log.error(f"获取用户信息失败: {e}")
+        log.error(f"获取用户信息失败: {type(e).__name__}")
         return None
 
 
@@ -355,17 +356,17 @@ async def get_user_email(credentials: Credentials) -> Optional[str]:
         if user_info:
             email = user_info.get("email")
             if email:
-                log.info(f"成功获取邮箱地址: {email}")
+                log.info("成功获取邮箱地址")
                 return email
             else:
-                log.warning(f"userinfo响应中没有邮箱信息: {user_info}")
+                log.warning("userinfo响应中没有邮箱信息")
                 return None
         else:
             log.warning("获取用户信息失败")
             return None
 
     except Exception as e:
-        log.error(f"获取用户邮箱失败: {e}")
+        log.error(f"获取用户邮箱失败: {type(e).__name__}")
         return None
 
 
@@ -382,7 +383,7 @@ async def fetch_user_email_from_file(cred_data: Dict[str, Any]) -> Optional[str]
         return await get_user_email(credentials)
 
     except Exception as e:
-        log.error(f"从凭证数据获取用户邮箱失败: {e}")
+        log.error(f"从凭证数据获取用户邮箱失败: {type(e).__name__}")
         return None
 
 
@@ -396,7 +397,7 @@ async def validate_token(token: str) -> Optional[Dict[str, Any]]:
         response.raise_for_status()
         return response.json()
     except Exception as e:
-        log.error(f"验证令牌失败: {e}")
+        log.error(f"验证令牌失败: {type(e).__name__}")
         return None
 
 
@@ -447,9 +448,7 @@ async def fetch_project_id_and_tier(
         subscription_tier = _map_raw_tier(raw_tier)
 
         if raw_tier:
-            log.info(
-                f"[fetch_project_id_and_tier] Raw tier '{raw_tier}' mapped to '{subscription_tier}'"
-            )
+            log.info("[fetch_project_id_and_tier] 订阅等级已解析")
 
         if project_id:
             return project_id, subscription_tier
@@ -457,7 +456,7 @@ async def fetch_project_id_and_tier(
         log.warning("[fetch_project_id_and_tier] loadCodeAssist did not return project_id")
 
     except Exception as e:
-        log.warning(f"[fetch_project_id_and_tier] loadCodeAssist failed: {type(e).__name__}: {e}")
+        log.warning(f"[fetch_project_id_and_tier] loadCodeAssist failed: {type(e).__name__}")
 
     # 获取失败 -> 使用固定回退值，避免空 project_id 写入数据库
     log.warning("[fetch_project_id_and_tier] 使用回退 project_id: aicode-consumers")
@@ -482,8 +481,7 @@ async def _try_load_code_assist(
         }
     }
 
-    log.debug(f"[loadCodeAssist] Fetching project_id from: {request_url}")
-    log.debug(f"[loadCodeAssist] Request body: {request_body}")
+    log.debug("[loadCodeAssist] Fetching project_id")
 
     response = await post_async(
         request_url,
@@ -495,11 +493,7 @@ async def _try_load_code_assist(
     log.debug(f"[loadCodeAssist] Response status: {response.status_code}")
 
     if response.status_code == 200:
-        response_text = response.text
-        log.debug(f"[loadCodeAssist] Response body: {response_text}")
-
         data = response.json()
-        log.debug(f"[loadCodeAssist] Response JSON keys: {list(data.keys())}")
 
         # 提取订阅等级 - 优先使用 paidTier（更准确反映实际权益）
         paid_tier = data.get("paidTier", {})
@@ -509,10 +503,10 @@ async def _try_load_code_assist(
         subscription_tier = None
         if isinstance(paid_tier, dict) and paid_tier.get("id"):
             subscription_tier = paid_tier.get("id")
-            log.info(f"[loadCodeAssist] Found paidTier: {subscription_tier}")
+            log.info("[loadCodeAssist] Found paidTier")
         elif isinstance(current_tier, dict) and current_tier.get("id"):
             subscription_tier = current_tier.get("id")
-            log.info(f"[loadCodeAssist] Found currentTier: {subscription_tier}")
+            log.info("[loadCodeAssist] Found currentTier")
 
         # 检查是否有 currentTier（表示用户已激活）
         if current_tier:
@@ -521,7 +515,7 @@ async def _try_load_code_assist(
             # 使用服务器返回的 project_id
             project_id = data.get("cloudaicompanionProject")
             if project_id:
-                log.info(f"[loadCodeAssist] Successfully fetched project_id: {project_id}, tier: {subscription_tier}")
+                log.info("[loadCodeAssist] Successfully fetched project_id")
                 return project_id, subscription_tier
 
             log.warning("[loadCodeAssist] No project_id in response")
@@ -531,5 +525,4 @@ async def _try_load_code_assist(
             return None, None
     else:
         log.warning(f"[loadCodeAssist] Failed: HTTP {response.status_code}")
-        log.warning(f"[loadCodeAssist] Response body: {response.text[:500]}")
-        raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+        raise Exception(f"HTTP {response.status_code}")

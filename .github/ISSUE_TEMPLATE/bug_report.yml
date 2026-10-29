@@ -8,6 +8,7 @@ body:
       value: |
         ## 感谢你的反馈!
         请填写以下信息以帮助我们更快定位问题。
+        提交公开 Issue 前，请移除密码、API Key、OAuth 授权码及 Token、Authorization / Cookie 等请求头、网址中的 ?key=、邮箱、代理账号密码，以及请求和响应中的私人内容。截图也需遮挡这些资料。
   
   - type: checkboxes
     id: checklist
@@ -17,6 +18,8 @@ body:
         - label: 我已经搜索过现有的 issues,确认这不是重复问题
           required: true
         - label: 我已经阅读过项目文档
+          required: true
+        - label: 我已遮蔽日志、截图和网址中的密码、Token、邮箱及私人请求内容
           required: true
   
   - type: dropdown
@@ -65,9 +68,9 @@ body:
     id: error-content
     attributes:
       label: 具体报错内容
-      description: 请粘贴完整的错误信息或截图
+      description: 请先脱敏，再粘贴相关错误片段或截图；不要提交完整凭证、请求体或响应内容
       placeholder: |
-        请在这里粘贴完整的错误日志或堆栈信息
+        请在这里粘贴已脱敏的错误日志或堆栈信息
       render: shell
     validations:
       required: true

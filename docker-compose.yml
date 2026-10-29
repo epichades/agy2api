@@ -1,25 +1,34 @@
-version: '3.8'
-
 services:
   agy2api:
-    image: ghcr.io/su-kaka/agy2api:latest
-    container_name: agy2api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agy2api-local:reviewed
     restart: unless-stopped
-    network_mode: host
+    init: true
+    user: "10001:10001"
+    env_file:
+      - .env
     environment:
-      # 密码配置（分离密码）
-      - API_PASSWORD=${API_PASSWORD:-your_api_password}
-      - PANEL_PASSWORD=${PANEL_PASSWORD:-your_panel_password}
-
-      # 服务器配置
-      - PORT=${PORT:-7861}
-      - HOST=${HOST:-0.0.0.0}
-
-      # 可选: PostgreSQL 配置 (分布式存储)
-      # - POSTGRESQL_URI=${POSTGRESQL_URI}
-
-      # 可选: 代理配置
-      # - PROXY=${PROXY}
+      API_PASSWORD: ${API_PASSWORD:?Set API_PASSWORD in a private .env file}
+      PANEL_PASSWORD: ${PANEL_PASSWORD:?Set PANEL_PASSWORD in a private .env file}
+      HOST: "0.0.0.0"
+      PORT: "7861"
+      WORKERS: "1"
+      CREDENTIALS_DIR: /app/creds
+      LOG_FILE: ""
+    ports:
+      - "127.0.0.1:${PORT:-7861}:7861"
     volumes:
-      - ./data/creds:/app/creds
-      - ./data/request_logs:/app/data/request_logs
+      - credentials:/app/creds
+      - request_logs:/app/data/request_logs
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  credentials:
+  request_logs:

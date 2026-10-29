@@ -1,7 +1,7 @@
-git fetch --all
-for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD') do set branch=%%b
-git reset --hard origin/%branch%
-uv sync
-call .venv\Scripts\activate.bat
-python web.py
+@echo off
+cd /d "%~dp0"
+rem Start the current checkout; update separately to preserve local changes.
+uv sync --locked --no-dev
+if errorlevel 1 exit /b %errorlevel%
+uv run --no-sync python web.py
 pause
