@@ -5,17 +5,22 @@ Anthropic 到 Gemini 格式转换器
 """
 from __future__ import annotations
 
+import codecs
+import copy
 import json
 import os
 import uuid
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from fastapi import Response
 from log import log
 from src.converter.utils import merge_system_messages
+from src.converter.openai2gemini import _normalize_function_name
+from src.router.stream_passthrough import close_async_iterator
 
 from src.converter.thoughtSignature_fix import (
     decode_tool_id_and_signature,
+    encode_tool_id_with_signature,
     is_internal_placeholder_text,
     is_skip_thought_signature_placeholder,
     SKIP_THOUGHT_SIGNATURE_VALIDATOR,
@@ -383,10 +388,10 @@ def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[L
 
     gemini_tools: List[Dict[str, Any]] = []
     for tool in anthropic_tools:
-        name = tool.get("name", "nameless_function")
+        name = _normalize_function_name(tool.get("name", "nameless_function"))
         description = tool.get("description", "")
         input_schema = tool.get("input_schema", {}) or {}
-        parameters = clean_json_schema(input_schema)
+        parameters = copy.deepcopy(input_schema)
 
         gemini_tools.append(
             {
@@ -408,145 +413,110 @@ def convert_tools(anthropic_tools: Optional[List[Dict[str, Any]]]) -> Optional[L
 # ============================================================================
 
 def _extract_tool_result_output(content: Any) -> str:
-    """从 tool_result.content 中提取输出字符串"""
-    if isinstance(content, list):
-        if not content:
-            return ""
-        first = content[0]
-        if isinstance(first, dict) and first.get("type") == "text":
-            return str(first.get("text", ""))
-        return str(first)
+    """Preserve every text block; never stringify unsupported multimodal results."""
     if content is None:
         return ""
-    return str(content)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        if not all(isinstance(part, dict) and part.get("type") == "text"
+                   and isinstance(part.get("text"), str) for part in content):
+            raise ValueError("tool_result.content supports text blocks only")
+        return "".join(part["text"] for part in content)
+    raise ValueError("tool_result.content must be a string or text block array")
 
 
 def convert_messages_to_contents(
-    messages: List[Dict[str, Any]],
-    *,
-    include_thinking: bool = True
+    messages: List[Dict[str, Any]], *, include_thinking: bool = True
 ) -> List[Dict[str, Any]]:
-    """
-    将 Anthropic messages[] 转换为下游 contents[]（role: user/model, parts: []）。
+    """Convert content at its original position, retaining signed history exactly."""
+    if not isinstance(messages, list):
+        raise ValueError("messages must be an array")
+    tool_names: Dict[str, str] = {}
+    for message in messages:
+        for item in message.get("content", []) if isinstance(message.get("content"), list) else []:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                if not isinstance(item.get("name"), str) or not item["name"]:
+                    raise ValueError("tool_use.name is required")
+                tool_names[str(item.get("id", ""))] = _normalize_function_name(item["name"])
 
-    Args:
-        messages: Anthropic 格式的消息列表
-        include_thinking: 是否包含 thinking 块
-    """
     contents: List[Dict[str, Any]] = []
-
-    # 第一遍：构建 tool_use_id -> (name, thoughtsignature) 的映射
-    # 注意：存储的是编码后的 ID（可能包含签名）
-    tool_use_info: Dict[str, tuple[str, Optional[str]]] = {}
-    for msg in messages:
-        raw_content = msg.get("content", "")
-        if isinstance(raw_content, list):
-            for item in raw_content:
-                if isinstance(item, dict) and item.get("type") == "tool_use":
-                    encoded_tool_id = item.get("id")
-                    tool_name = item.get("name")
-                    if encoded_tool_id and tool_name:
-                        # 解码获取原始ID和签名
-                        original_id, thoughtsignature = decode_tool_id_and_signature(encoded_tool_id)
-                        # 存储映射：编码ID -> (name, thoughtsignature)
-                        tool_use_info[str(encoded_tool_id)] = (tool_name, thoughtsignature)
-
-    for msg in messages:
-        role = msg.get("role", "user")
-        
-        # system/developer 消息已经由 merge_system_messages 处理，这里跳过
-        if role in ("system", "developer"):
-            continue
-        
-        # 支持 'assistant' 和 'model' 角色（Google history usage）
-        gemini_role = "model" if role in ("assistant", "model") else "user"
-        raw_content = msg.get("content", "")
-
+    for message in messages:
+        role = message.get("role", "user")
+        if role not in ("user", "assistant", "model"):
+            raise ValueError("messages contain an unsupported role")
+        content = message.get("content")
+        raw_parts = [{"type": "text", "text": content}] if isinstance(content, str) else content
+        if not isinstance(raw_parts, list):
+            raise ValueError("message content must be a string or content block array")
         parts: List[Dict[str, Any]] = []
-        if isinstance(raw_content, str):
-            if _is_non_whitespace_text(raw_content):
-                parts = [{"text": str(raw_content)}]
-        elif isinstance(raw_content, list):
-            for item in raw_content:
-                if not isinstance(item, dict):
-                    if _is_non_whitespace_text(item):
-                        parts.append({"text": str(item)})
-                    continue
-
-                item_type = item.get("type")
-                if item_type == "thinking":
-                    # 不把客户端回传的 thinking signature 再送给 Google。
-                    # 这些签名很容易在中转/换号/裁剪后变成 Corrupted thought signature。
-                    continue
-                elif item_type == "redacted_thinking":
-                    continue
-                elif item_type == "text":
-                    text = item.get("text", "")
-                    if _is_non_whitespace_text(text):
-                        parts.append({"text": str(text)})
-                elif item_type == "image":
-                    source = item.get("source", {}) or {}
-                    if source.get("type") == "base64":
-                        parts.append(
-                            {
-                                "inlineData": {
-                                    "mimeType": source.get("media_type", "image/png"),
-                                    "data": source.get("data", ""),
-                                }
-                            }
-                        )
-                elif item_type == "tool_use":
-                    encoded_id = item.get("id") or ""
-                    original_id, _ = decode_tool_id_and_signature(encoded_id)
-
-                    fc_part: Dict[str, Any] = {
-                        "functionCall": {
-                            "id": original_id,  # 使用原始ID，不带签名
-                            "name": item.get("name"),
-                            "args": item.get("input", {}) or {},
-                        }
-                    }
-
-                    fc_part["thoughtSignature"] = SKIP_THOUGHT_SIGNATURE_VALIDATOR
-
-                    parts.append(fc_part)
-                elif item_type == "tool_result":
-                    output = _extract_tool_result_output(item.get("content"))
-                    encoded_tool_use_id = item.get("tool_use_id") or ""
-                    
-                    # 解码获取原始ID（functionResponse不需要签名）
-                    original_tool_use_id, _ = decode_tool_id_and_signature(encoded_tool_use_id)
-
-                    # 从 tool_result 获取 name，如果没有则从映射中查找
-                    func_name = item.get("name")
-                    if not func_name and encoded_tool_use_id:
-                        # 使用编码ID查找映射
-                        tool_info = tool_use_info.get(str(encoded_tool_use_id))
-                        if tool_info:
-                            func_name = tool_info[0]  # 获取 name
-                    if not func_name:
-                        func_name = "unknown_function"
-                    
-                    parts.append(
-                        {
-                            "functionResponse": {
-                                "id": original_tool_use_id,  # 使用解码后的原始ID以匹配functionCall
-                                "name": func_name,
-                                "response": {"output": output},
-                            }
-                        }
-                    )
-                else:
-                    parts.append({"text": json.dumps(item, ensure_ascii=False)})
-        else:
-            if _is_non_whitespace_text(raw_content):
-                parts = [{"text": str(raw_content)}]
-
-        if not parts:
-            continue
-
-        contents.append({"role": gemini_role, "parts": parts})
-
+        for item in raw_parts:
+            if not isinstance(item, dict):
+                raise ValueError("content blocks must be objects")
+            kind = item.get("type")
+            if not isinstance(kind, str):
+                raise ValueError("Anthropic content block type must be a string")
+            fields = {
+                "text": {"type", "text", "cache_control", "citations"},
+                "thinking": {"type", "thinking", "signature", "thoughtSignature", "cache_control"},
+                "image": {"type", "source", "cache_control"},
+                "tool_use": {"type", "id", "name", "input", "cache_control"},
+                "tool_result": {"type", "tool_use_id", "name", "content", "is_error", "cache_control"},
+            }
+            if kind in fields and set(item) - fields[kind]:
+                raise ValueError("Unsupported Anthropic content block parameter")
+            if kind == "text":
+                if not isinstance(item.get("text"), str):
+                    raise ValueError("text blocks require a string")
+                parts.append({"text": item["text"]})
+            elif kind == "thinking":
+                if not include_thinking:
+                    raise ValueError("thinking history cannot be silently omitted")
+                text = item.get("thinking")
+                signature = item.get("signature", item.get("thoughtSignature"))
+                if item.get("signature") is not None and item.get("thoughtSignature") is not None and item["signature"] != item["thoughtSignature"]:
+                    raise ValueError("thinking signature aliases disagree")
+                if role not in ("assistant", "model") or not isinstance(text, str) or not text or not isinstance(signature, str) or not signature or signature == SKIP_THOUGHT_SIGNATURE_VALIDATOR:
+                    raise ValueError("thinking history requires original text and signature")
+                parts.append({"thought": True, "text": text, "thoughtSignature": signature})
+            elif kind == "redacted_thinking":
+                raise ValueError("redacted_thinking is not supported by the Antigravity upstream")
+            elif kind == "image":
+                source = item.get("source")
+                if not isinstance(source, dict) or source.get("type") != "base64" or not isinstance(source.get("data"), str) or set(source) - {"type", "media_type", "data"}:
+                    raise ValueError("image blocks support base64 sources only")
+                parts.append({"inlineData": {"mimeType": source.get("media_type", "image/png"), "data": source["data"]}})
+            elif kind == "tool_use":
+                encoded_id = item.get("id")
+                name = item.get("name")
+                args = item.get("input", {})
+                if role not in ("assistant", "model") or not isinstance(encoded_id, str) or not encoded_id or not isinstance(name, str) or not name or not isinstance(args, dict):
+                    raise ValueError("tool_use requires an id, name and object input in assistant content")
+                tool_id, signature = decode_tool_id_and_signature(encoded_id)
+                part = {"functionCall": {"id": tool_id, "name": _normalize_function_name(name), "args": copy.deepcopy(args)}}
+                if signature and signature != SKIP_THOUGHT_SIGNATURE_VALIDATOR:
+                    part["thoughtSignature"] = signature
+                parts.append(part)
+            elif kind == "tool_result":
+                encoded_id = item.get("tool_use_id")
+                if role != "user" or not isinstance(encoded_id, str) or not encoded_id:
+                    raise ValueError("tool_result requires tool_use_id in user content")
+                tool_id, _ = decode_tool_id_and_signature(encoded_id)
+                name = tool_names.get(encoded_id)
+                if name is None and isinstance(item.get("name"), str):
+                    name = _normalize_function_name(item["name"])
+                if name is None:
+                    raise ValueError("tool_result has no matching tool_use")
+                result = {"output": _extract_tool_result_output(item.get("content"))}
+                if "is_error" in item:
+                    if not isinstance(item["is_error"], bool):
+                        raise ValueError("tool_result.is_error must be a boolean")
+                    result["is_error"] = item["is_error"]
+                parts.append({"functionResponse": {"id": tool_id, "name": name, "response": result}})
+            else:
+                raise ValueError("Unsupported Anthropic content block type")
+        if parts:
+            contents.append({"role": "model" if role in ("assistant", "model") else "user", "parts": parts})
     return contents
 
 
@@ -620,6 +590,8 @@ def convert_tool_choice_to_tool_config(tool_choice: Any) -> Optional[Dict[str, A
         
         if choice_type == "auto":
             return {"functionCallingConfig": {"mode": "AUTO"}}
+        elif choice_type == "none":
+            return {"functionCallingConfig": {"mode": "NONE"}}
         elif choice_type == "any":
             return {"functionCallingConfig": {"mode": "ANY"}}
         elif choice_type == "tool":
@@ -628,7 +600,7 @@ def convert_tool_choice_to_tool_config(tool_choice: Any) -> Optional[Dict[str, A
                 return {
                     "functionCallingConfig": {
                         "mode": "ANY",
-                        "allowedFunctionNames": [tool_name],
+                        "allowedFunctionNames": [_normalize_function_name(tool_name)],
                     }
                 }
     
@@ -641,82 +613,27 @@ def convert_tool_choice_to_tool_config(tool_choice: Any) -> Optional[Dict[str, A
 # ============================================================================
 
 def build_generation_config(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    根据 Anthropic Messages 请求构造下游 generationConfig。
-
-    Returns:
-        generation_config: 生成配置字典
-    """
-    config: Dict[str, Any] = {
-        "topP": 1,
-        "candidateCount": 1,
-        "stopSequences": [
-            "<|user|>",
-            "<|bot|>",
-            "<|context_request|>",
-            "<|endoftext|>",
-            "<|end_of_turn|>",
-        ],
-    }
-
-    temperature = payload.get("temperature", None)
-    config["temperature"] = DEFAULT_TEMPERATURE if temperature is None else temperature
-
-    top_p = payload.get("top_p", None)
-    if top_p is not None:
-        config["topP"] = top_p
-
-    top_k = payload.get("top_k", None)
-    if top_k is not None:
-        config["topK"] = top_k
-
-    max_tokens = payload.get("max_tokens")
-    if max_tokens is not None:
-        config["maxOutputTokens"] = max_tokens
-
-    # 处理 extended thinking 参数 (plan mode)
+    """Map only client-specified sampling and limits; do not invent stop strings."""
+    config: Dict[str, Any] = {}
+    names = {"temperature": "temperature", "top_p": "topP", "top_k": "topK",
+             "max_tokens": "maxOutputTokens", "stop_sequences": "stopSequences"}
+    for client_name, upstream_name in names.items():
+        if payload.get(client_name) is not None:
+            config[upstream_name] = copy.deepcopy(payload[client_name])
     thinking = payload.get("thinking")
-    is_plan_mode = False
-    if thinking and isinstance(thinking, dict):
-        thinking_type = thinking.get("type")
-        budget_tokens = thinking.get("budget_tokens")
-        
-        # 如果启用了 extended thinking，设置 thinkingConfig
-        if thinking_type == "enabled":
-            is_plan_mode = True
-            thinking_config: Dict[str, Any] = {}
-            
-            # 设置思考预算，默认使用较大的值以支持计划模式
-            if budget_tokens is not None:
-                thinking_config["thinkingBudget"] = budget_tokens
-            else:
-                # 默认给一个较大的思考预算以支持完整的计划生成
-                thinking_config["thinkingBudget"] = 48000
-            
-            # 始终包含思考内容，这样才能看到计划
-            thinking_config["includeThoughts"] = True
-            
-            config["thinkingConfig"] = thinking_config
-            log.info(f"[ANTHROPIC2GEMINI] Extended thinking enabled with budget: {thinking_config['thinkingBudget']}")
-        elif thinking_type == "disabled":
-            # 明确禁用思考模式
-            config["thinkingConfig"] = {
-                "includeThoughts": False
-            }
-            log.info("[ANTHROPIC2GEMINI] Extended thinking explicitly disabled")
-
-    stop_sequences = payload.get("stop_sequences")
-    if isinstance(stop_sequences, list) and stop_sequences:
-        config["stopSequences"] = config["stopSequences"] + [str(s) for s in stop_sequences]
-    elif is_plan_mode:
-        # Plan mode 时清空默认 stop sequences，避免过早停止
-        # 默认的 stop sequences 可能会导致模型在生成计划时过早停止
-        config["stopSequences"] = []
-        log.info("[ANTHROPIC2GEMINI] Plan mode: cleared default stop sequences to prevent premature stopping")
-    
-    # 如果不是 plan mode 且没有自定义 stop_sequences，保持默认值
-    # (默认值已经在 config 初始化时设置)
-
+    if thinking:
+        kind = thinking.get("type")
+        if kind == "enabled":
+            budget = thinking.get("budget_tokens")
+            if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1024:
+                raise ValueError("thinking.enabled requires budget_tokens >= 1024")
+            config["thinkingConfig"] = {"includeThoughts": True, "thinkingBudget": budget}
+        elif kind == "adaptive":
+            config["thinkingConfig"] = {"includeThoughts": True}
+        elif kind == "disabled":
+            config["thinkingConfig"] = {"includeThoughts": False}
+        else:
+            raise ValueError("Unsupported thinking configuration")
     return config
 
 
@@ -743,33 +660,15 @@ async def anthropic_to_gemini_request(payload: Dict[str, Any]) -> Dict[str, Any]
         - toolConfig: 工具调用配置 (如果有 tool_choice)
     """
     # 处理连续的system消息（兼容性模式）
-    payload = await merge_system_messages(payload)
+    payload = await merge_system_messages(copy.deepcopy(payload))
 
     # 提取和转换基础信息
     messages = payload.get("messages") or []
     if not isinstance(messages, list):
         messages = []
     
-    # [CRITICAL FIX] 过滤并修复 Thinking 块签名
-    # 在转换前先过滤无效的 thinking 块
-    filter_invalid_thinking_blocks(messages)
-
-    # 构建生成配置
     generation_config = build_generation_config(payload)
-
-    # 转换消息内容（始终包含thinking块，由响应端处理）
     contents = convert_messages_to_contents(messages, include_thinking=True)
-    
-    # [CRITICAL FIX] 移除尾部无签名的 thinking 块
-    # 对真实请求应用额外的清理
-    for content in contents:
-        role = content.get("role", "")
-        if role == "model":  # 只处理 model/assistant 消息
-            parts = content.get("parts", [])
-            if isinstance(parts, list):
-                remove_trailing_unsigned_thinking(parts)
-    
-    contents = reorganize_tool_messages(contents)
 
     # 转换工具
     tools = convert_tools(payload.get("tools"))
@@ -801,525 +700,336 @@ async def anthropic_to_gemini_request(payload: Dict[str, Any]) -> Dict[str, Any]
     return gemini_request
 
 
-def gemini_to_anthropic_response(
-    gemini_response: Dict[str, Any],
-    model: str,
-    status_code: int = 200
-) -> Dict[str, Any]:
-    """
-    将 Gemini 格式非流式响应转换为 Anthropic 格式非流式响应
+class AnthropicStreamError(ValueError):
+    """A malformed/failed upstream stream cannot become a successful message."""
 
-    注意: 如果收到的不是 200 开头的响应体，不做任何处理，直接转发
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
 
-    Args:
-        gemini_response: Gemini 格式的响应体字典
-        model: 模型名称
-        status_code: HTTP 状态码 (默认 200)
 
-    Returns:
-        Anthropic 格式的响应体字典，或原始响应 (如果状态码不是 2xx)
-    """
-    # 非 2xx 状态码直接返回原始响应
-    if not (200 <= status_code < 300):
-        return gemini_response
+def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
+    return ("event: " + event + "\ndata: " + json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n\n").encode("utf-8")
 
-    # 处理 Antigravity 的 response 包装格式
-    if "response" in gemini_response:
-        response_data = gemini_response["response"]
-    else:
-        response_data = gemini_response
 
-    # 提取候选结果
-    candidate = response_data.get("candidates", [{}])[0] or {}
-    parts = candidate.get("content", {}).get("parts", []) or []
+async def iter_gemini_stream_events(stream):
+    """Decode complete SSE frames, including byte/UTF-8 splits and aiter_lines."""
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    buffer = ""
+    data_lines: List[str] = []
+    done = False
 
-    # 获取 usage metadata
-    usage_metadata = {}
-    if "usageMetadata" in response_data:
-        usage_metadata = response_data["usageMetadata"]
-    elif "usageMetadata" in candidate:
-        usage_metadata = candidate["usageMetadata"]
+    def line_event(line: str):
+        nonlocal done, data_lines
+        if line.endswith("\r"):
+            line = line[:-1]
+        if line == "":
+            if not data_lines:
+                return None
+            raw = "\n".join(data_lines)
+            data_lines = []
+            if raw.strip() == "[DONE]":
+                done = True
+                return None
+            if done:
+                raise AnthropicStreamError("Upstream sent data after its end marker")
+            try:
+                event = json.loads(raw)
+            except (ValueError, TypeError) as error:
+                raise AnthropicStreamError("Upstream returned malformed SSE JSON") from error
+            if not isinstance(event, dict):
+                raise AnthropicStreamError("Upstream SSE payload must be an object")
+            return event
+        if line.startswith(":") or line.startswith(("event:", "id:", "retry:")):
+            return None
+        if line.startswith("data:"):
+            data_lines.append(line[5:].removeprefix(" "))
+            return None
+        raise AnthropicStreamError("Upstream returned an unsupported SSE field")
 
-    # 转换内容块
-    content = []
-    has_tool_use = False
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, Response):
+                yield chunk
+                return
+            if isinstance(chunk, str):
+                text = chunk
+                # The shared API's non-native transport is httpx.aiter_lines().
+                if "\n" not in text:
+                    text += "\n"
+            elif isinstance(chunk, (bytes, bytearray)):
+                try:
+                    text = decoder.decode(bytes(chunk))
+                except UnicodeError as error:
+                    raise AnthropicStreamError("Upstream SSE is not valid UTF-8") from error
+            else:
+                raise AnthropicStreamError("Upstream stream returned an unsupported chunk")
+            buffer += text
+            if len(buffer) > 8 * 1024 * 1024 or sum(map(len, data_lines)) > 8 * 1024 * 1024:
+                raise AnthropicStreamError("Upstream SSE frame is too large")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                event = line_event(line)
+                if event is not None:
+                    yield event
+        try:
+            buffer += decoder.decode(b"", final=True)
+        except UnicodeError as error:
+            raise AnthropicStreamError("Upstream SSE ended inside a UTF-8 character") from error
+        if buffer:
+            event = line_event(buffer)
+            if event is not None:
+                yield event
+        event = line_event("")
+        if event is not None:
+            yield event
+    finally:
+        await close_async_iterator(stream)
 
-    for part in parts:
-        if not isinstance(part, dict):
-            continue
 
-        # 处理 thinking 块
-        if part.get("thought") is True:
+class AnthropicStreamState:
+    """One ordered mapping shared by native streaming and non-stream aggregation."""
+
+    def __init__(self, model: str, tool_names: Optional[Dict[str, str]] = None, display_thinking: bool = True,
+                 signature_encoder: Optional[Callable[[str, str], str]] = None, function_encoder=None):
+        self.model = model
+        self.id = "msg_" + uuid.uuid4().hex
+        self.tool_names = tool_names or {}
+        self.display_thinking = display_thinking
+        self.signature_encoder = signature_encoder
+        self.function_encoder = function_encoder
+        self.upstream_signatures = {}
+        self.content: List[Dict[str, Any]] = []
+        self.current: Optional[int] = None
+        self.started = False
+        self.usage_metadata: Dict[str, Any] = {}
+        self.finish_reason: Optional[str] = None
+        self.seen_tool_ids: set[str] = set()
+
+    def start(self) -> List[bytes]:
+        if self.started:
+            return []
+        self.started = True
+        return [_sse_event("message_start", {"type": "message_start", "message": {
+            "id": self.id, "type": "message", "role": "assistant", "model": self.model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": _anthropic_usage_from_metadata(self.usage_metadata)}})]
+
+    def close_block(self) -> List[bytes]:
+        if self.current is None:
+            return []
+        index = self.current
+        self.current = None
+        return [_sse_event("content_block_stop", {"type": "content_block_stop", "index": index})]
+
+    def open_block(self, kind: str) -> List[bytes]:
+        events = self.close_block()
+        block = {"type": "thinking", "thinking": "", "signature": ""} if kind == "thinking" else {"type": "text", "text": ""}
+        self.current = len(self.content)
+        self.content.append(block)
+        events.append(_sse_event("content_block_start", {"type": "content_block_start", "index": self.current, "content_block": dict(block)}))
+        if kind == "thinking" and not self.display_thinking:
+            events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": self.current,
+                "delta": {"type": "thinking_delta", "thinking": ""}}))
+        return events
+
+    def feed(self, data: Dict[str, Any]) -> List[bytes]:
+        data = data.get("response", data)
+        if not isinstance(data, dict):
+            raise AnthropicStreamError("Upstream response must be an object")
+        if "error" in data:
+            error = data["error"]
+            message = error.get("message", "Upstream request failed") if isinstance(error, dict) else str(error)
+            raise AnthropicStreamError(str(message))
+        usage = data.get("usageMetadata")
+        if isinstance(usage, dict):
+            self.usage_metadata.update(usage)
+        candidates = data.get("candidates", [])
+        if not isinstance(candidates, list):
+            raise AnthropicStreamError("Upstream candidates must be an array")
+        if len(candidates) > 1:
+            raise AnthropicStreamError("Native Messages supports one upstream candidate")
+        candidate = candidates[0] if candidates else {}
+        if not isinstance(candidate, dict):
+            raise AnthropicStreamError("Upstream candidate must be an object")
+        parts = (candidate.get("content") or {}).get("parts", [])
+        if not isinstance(parts, list):
+            raise AnthropicStreamError("Upstream content parts must be an array")
+        if self.finish_reason is not None and parts:
+            raise AnthropicStreamError("Upstream returned content after finishReason")
+        events = self.start()
+        for part in parts:
+            if not isinstance(part, dict):
+                raise AnthropicStreamError("Upstream content part must be an object")
             if is_skip_thought_signature_placeholder(part):
                 continue
-            thinking_text = part.get("text", "")
-            if thinking_text is None:
-                thinking_text = ""
-            
-            block: Dict[str, Any] = {"type": "thinking", "thinking": str(thinking_text)}
-            
-            # 如果有 thoughtsignature 则添加
-            thoughtsignature = part.get("thoughtSignature")
-            if thoughtsignature:
-                block["thoughtSignature"] = thoughtsignature
-            
-            content.append(block)
-            continue
-
-        # 处理文本块
-        if "text" in part:
-            text = part.get("text", "")
-            if (
-                is_skip_thought_signature_placeholder(part)
-                or is_internal_placeholder_text(text)
-            ):
-                continue
-            content.append({"type": "text", "text": text})
-            continue
-
-        # 处理工具调用
-        if "functionCall" in part:
-            has_tool_use = True
-            fc = part.get("functionCall", {}) or {}
-            original_id = fc.get("id") or f"toolu_{uuid.uuid4().hex}"
-            content.append(
-                {
-                    "type": "tool_use",
-                    "id": original_id,
-                    "name": fc.get("name") or "",
-                    "input": _remove_nulls_for_tool_input(fc.get("args", {}) or {}),
-                }
-            )
-            continue
-
-        # 处理图片
-        if "inlineData" in part:
-            inline = part.get("inlineData", {}) or {}
-            content.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": inline.get("mimeType", "image/png"),
-                        "data": inline.get("data", ""),
-                    },
-                }
-            )
-            continue
-
-    # 确定停止原因
-    finish_reason = candidate.get("finishReason")
-    
-    # 只有在正常停止（STOP）且有工具调用时才设为 tool_use
-    # 避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_use 导致循环
-    if has_tool_use and finish_reason == "STOP":
-        stop_reason = "tool_use"
-    elif finish_reason == "MAX_TOKENS":
-        stop_reason = "max_tokens"
-    else:
-        # 其他情况（SAFETY、RECITATION 等）默认为 end_turn
-        stop_reason = "end_turn"
-
-    # 提取 token 使用情况
-    usage = _anthropic_usage_from_metadata(usage_metadata)
-
-    # 构建 Anthropic 响应
-    message_id = f"msg_{uuid.uuid4().hex}"
-
-    return {
-        "id": message_id,
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": None,
-        "usage": usage,
-    }
-
-
-async def gemini_stream_to_anthropic_stream(
-    gemini_stream: AsyncIterator[bytes],
-    model: str,
-    status_code: int = 200
-) -> AsyncIterator[bytes]:
-    """
-    将 Gemini 格式流式响应转换为 Anthropic SSE 格式流式响应
-
-    注意: 如果收到的不是 200 开头的响应体，不做任何处理，直接转发
-
-    Args:
-        gemini_stream: Gemini 格式的流式响应 (bytes 迭代器)
-        model: 模型名称
-        status_code: HTTP 状态码 (默认 200)
-
-    Yields:
-        Anthropic SSE 格式的响应块 (bytes)
-    """
-    # 非 2xx 状态码直接转发原始流
-    if not (200 <= status_code < 300):
-        async for chunk in gemini_stream:
-            yield chunk
-        return
-
-    # 初始化状态
-    message_id = f"msg_{uuid.uuid4().hex}"
-    message_start_sent = False
-    current_block_type: Optional[str] = None
-    current_block_index = -1
-    current_thinking_signature: Optional[str] = None
-    has_tool_use = False
-    input_tokens = 0
-    output_tokens = 0
-    cached_input_tokens = 0
-    reasoning_tokens = 0
-    finish_reason: Optional[str] = None
-    stream_finished = False  # finishReason 收尾块之后只消费不转换（保持上游流走完以记录请求日志）
-
-    def _sse_event(event: str, data: Dict[str, Any]) -> bytes:
-        """生成 SSE 事件"""
-        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        return f"event: {event}\ndata: {payload}\n\n".encode("utf-8")
-
-    def _close_block() -> Optional[bytes]:
-        """关闭当前内容块"""
-        nonlocal current_block_type
-        if current_block_type is None:
-            return None
-        event = _sse_event(
-            "content_block_stop",
-            {"type": "content_block_stop", "index": current_block_index},
-        )
-        current_block_type = None
-        return event
-
-    def _usage_payload() -> Dict[str, Any]:
-        usage: Dict[str, Any] = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens + reasoning_tokens,
-        }
-        if cached_input_tokens > 0:
-            usage["cache_read_input_tokens"] = cached_input_tokens
-        if reasoning_tokens > 0:
-            usage["output_tokens_details"] = {"thinking_tokens": reasoning_tokens}
-        return usage
-
-    # 处理流式数据
-    try:
-        async for chunk in gemini_stream:
-            # 检查是否是 Response 对象（错误情况）
-            if isinstance(chunk, Response):
-                log.warning(f"[GEMINI_TO_ANTHROPIC] 收到 Response 对象，状态码: {chunk.status_code}，直接转发错误")
-                # 直接转发错误响应内容，不做格式转换
-                error_content = chunk.body if isinstance(chunk.body, bytes) else chunk.body.encode('utf-8')
-                yield error_content
-                return
-
-            # 记录接收到的原始chunk
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Raw chunk: {chunk[:200] if chunk else b''}")
-
-            # finishReason 之后的残余块只消费不转换：
-            # 提前 break 会沿生成器链下发 GeneratorExit，导致底层
-            # stream_request 的成功日志记录代码永远不执行（issue #438）
-            if stream_finished:
-                continue
-
-            # 解析 Gemini 流式块
-            if not chunk or not chunk.startswith(b"data: "):
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Skipping chunk (not SSE format or empty)")
-                continue
-
-            raw = chunk[6:].strip()
-            if raw == b"[DONE]":
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Received [DONE] marker")
-                # 同 finishReason：不 break，改为消费剩余块直到流自然结束，
-                # 避免向底层 stream_request 下发 GeneratorExit 导致日志丢失
-                stream_finished = True
-                continue
-
-            log.debug(f"[GEMINI_TO_ANTHROPIC] Parsing JSON: {raw[:200]}")
-
-            try:
-                data = json.loads(raw.decode('utf-8', errors='ignore'))
-                log.debug(f"[GEMINI_TO_ANTHROPIC] Parsed data: {json.dumps(data, ensure_ascii=False)[:300]}")
-            except Exception as e:
-                log.warning(f"[GEMINI_TO_ANTHROPIC] JSON parse error: {e}")
-                continue
-
-            # 处理 Antigravity 的 response 包装格式
-            if "response" in data:
-                response = data["response"]
+            if part.get("thought") is True:
+                text = part.get("text", "")
+                signature = part.get("thoughtSignature", part.get("thought_signature"))
+                if not isinstance(text, str) or signature is not None and not isinstance(signature, str):
+                    raise AnthropicStreamError("Upstream thinking has an invalid text or signature")
+                if not text and not signature:
+                    continue
+                if not text and signature and (self.current is None or self.content[self.current]["type"] != "thinking"):
+                    # A repeated closing signature is harmless; an orphan is not a new empty block.
+                    if self.content and self.content[-1].get("type") == "thinking" and self.upstream_signatures.get(len(self.content) - 1) == signature:
+                        continue
+                    raise AnthropicStreamError("Upstream returned a signature without its thinking block")
+                if self.current is None or self.content[self.current]["type"] != "thinking":
+                    events += self.open_block("thinking")
+                index = self.current
+                self.content[index]["thinking"] += text
+                if text and self.display_thinking:
+                    events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": index,
+                        "delta": {"type": "thinking_delta", "thinking": text}}))
+                if signature:
+                    self.upstream_signatures[index] = signature
+                    if not self.display_thinking:
+                        if self.signature_encoder is None:
+                            raise AnthropicStreamError("Omitted thinking requires authenticated replay state")
+                        signature = self.signature_encoder(signature, self.content[index]["thinking"])
+                    self.content[index]["signature"] = signature
+                    events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": index,
+                        "delta": {"type": "signature_delta", "signature": signature}}))
+                    events += self.close_block()
+            elif "text" in part:
+                text = part["text"]
+                if not isinstance(text, str):
+                    raise AnthropicStreamError("Upstream text must be a string")
+                if not text:
+                    continue
+                if self.current is None or self.content[self.current]["type"] != "text":
+                    events += self.open_block("text")
+                self.content[self.current]["text"] += text
+                events.append(_sse_event("content_block_delta", {"type": "content_block_delta", "index": self.current,
+                    "delta": {"type": "text_delta", "text": text}}))
+            elif "functionCall" in part:
+                events += self.close_block()
+                function = part["functionCall"]
+                if not isinstance(function, dict) or not isinstance(function.get("name"), str) or not function["name"] or not isinstance(function.get("args", {}), dict):
+                    raise AnthropicStreamError("Upstream returned an invalid function call")
+                tool_id = function.get("id") or "toolu_" + uuid.uuid4().hex
+                if not isinstance(tool_id, str) or tool_id in self.seen_tool_ids:
+                    raise AnthropicStreamError("Upstream reused a function call id")
+                self.seen_tool_ids.add(tool_id)
+                signature = part.get("thoughtSignature")
+                if signature and signature != SKIP_THOUGHT_SIGNATURE_VALIDATOR:
+                    if not isinstance(signature, str):
+                        raise AnthropicStreamError("Upstream function signature must be a string")
+                    if not self.display_thinking:
+                        if self.function_encoder is None:
+                            raise AnthropicStreamError("Omitted thinking requires authenticated function replay state")
+                        tool_id = self.function_encoder(tool_id, function["name"], function.get("args", {}), signature)
+                    else:
+                        tool_id = encode_tool_id_with_signature(tool_id, signature)
+                name = self.tool_names.get(function["name"], function["name"])
+                args = copy.deepcopy(function.get("args", {}))
+                index = len(self.content)
+                block = {"type": "tool_use", "id": tool_id, "name": name, "input": args}
+                self.content.append(block)
+                events += [
+                    _sse_event("content_block_start", {"type": "content_block_start", "index": index,
+                        "content_block": {**block, "input": {}}}),
+                    _sse_event("content_block_delta", {"type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}}),
+                    _sse_event("content_block_stop", {"type": "content_block_stop", "index": index}),
+                ]
             else:
-                response = data
+                raise AnthropicStreamError("Upstream returned an unsupported native Messages content part")
+        finish = candidate.get("finishReason")
+        if finish is not None:
+            if not isinstance(finish, str) or self.finish_reason not in (None, finish):
+                raise AnthropicStreamError("Upstream returned inconsistent finishReason")
+            self.finish_reason = finish
+        return events
 
-            candidate = (response.get("candidates", []) or [{}])[0] or {}
-            parts = (candidate.get("content", {}) or {}).get("parts", []) or []
+    def stop_reason(self) -> str:
+        tools = any(block["type"] == "tool_use" for block in self.content)
+        if self.finish_reason in ("STOP", "OTHER") and tools:
+            return "tool_use"
+        if self.finish_reason == "STOP":
+            return "end_turn"
+        if self.finish_reason == "MAX_TOKENS":
+            return "max_tokens"
+        if self.finish_reason in {"SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "IMAGE_SAFETY"}:
+            return "refusal"
+        if self.finish_reason is None:
+            raise AnthropicStreamError("Upstream stream ended without finishReason")
+        raise AnthropicStreamError("Upstream stream did not complete successfully")
 
-            # 更新 usage metadata
-            if "usageMetadata" in response:
-                usage = response["usageMetadata"]
-                if isinstance(usage, dict):
-                    if "promptTokenCount" in usage:
-                        prompt_tokens_total = int(usage.get("promptTokenCount", 0) or 0)
-                        input_tokens = max(prompt_tokens_total - cached_input_tokens, 0)
-                    if "candidatesTokenCount" in usage:
-                        output_tokens = int(usage.get("candidatesTokenCount", 0) or 0)
-                    if "thoughtsTokenCount" in usage:
-                        reasoning_tokens = int(usage.get("thoughtsTokenCount", 0) or 0)
-                    if "cachedContentTokenCount" in usage:
-                        cached_input_tokens = int(usage.get("cachedContentTokenCount", 0) or 0)
-                        input_tokens = max(
-                            int(usage.get("promptTokenCount", 0) or 0) - cached_input_tokens,
-                            0,
-                        )
+    def finish(self) -> List[bytes]:
+        reason = self.stop_reason()
+        for block in self.content:
+            if block["type"] == "thinking" and not block.get("signature"):
+                raise AnthropicStreamError("Upstream thinking omitted its replay signature")
+        return self.close_block() + [
+            _sse_event("message_delta", {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": None},
+                "usage": _anthropic_usage_from_metadata(self.usage_metadata)}),
+            _sse_event("message_stop", {"type": "message_stop"}),
+        ]
 
-            # 发送 message_start（仅一次）
-            if not message_start_sent:
-                message_start_sent = True
-                yield _sse_event(
-                    "message_start",
-                    {
-                        "type": "message_start",
-                        "message": {
-                            "id": message_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "model": model,
-                            "content": [],
-                            "stop_reason": None,
-                            "stop_sequence": None,
-                            "usage": _usage_payload(),
-                        },
-                    },
-                )
+    def response(self) -> Dict[str, Any]:
+        self.finish()
+        blocks = copy.deepcopy(self.content)
+        if not self.display_thinking:
+            for block in blocks:
+                if block["type"] == "thinking":
+                    block["thinking"] = ""
+        return {"id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": blocks,
+                "stop_reason": self.stop_reason(), "stop_sequence": None,
+                "usage": _anthropic_usage_from_metadata(self.usage_metadata)}
 
-            # 处理各种 parts
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
 
-                # 处理 thinking 块
-                if part.get("thought") is True:
-                    if is_skip_thought_signature_placeholder(part):
-                        continue
-                    thinking_text = part.get("text", "")
-                    thoughtsignature = part.get("thoughtSignature")
-                    
-                    # 检查是否需要关闭上一个块并开启新的 thinking 块
-                    if current_block_type != "thinking":
-                        close_evt = _close_block()
-                        if close_evt:
-                            yield close_evt
+def gemini_to_anthropic_response(gemini_response: Dict[str, Any], model: str, status_code: int = 200,
+                                tool_names: Optional[Dict[str, str]] = None, display_thinking: bool = True,
+                                signature_encoder=None, function_encoder=None) -> Dict[str, Any]:
+    if not 200 <= status_code < 300:
+        return gemini_response
+    state = AnthropicStreamState(model, tool_names, display_thinking, signature_encoder, function_encoder)
+    state.feed(gemini_response)
+    return state.response()
 
-                        current_block_index += 1
-                        current_block_type = "thinking"
-                        current_thinking_signature = thoughtsignature
 
-                        block: Dict[str, Any] = {"type": "thinking", "thinking": ""}
-                        if thoughtsignature:
-                            block["thoughtSignature"] = thoughtsignature
-                        yield _sse_event(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": current_block_index,
-                                "content_block": block,
-                            },
-                        )
-                    elif thoughtsignature and thoughtsignature != current_thinking_signature:
-                        # 签名变化，需要开启新的 thinking 块
-                        close_evt = _close_block()
-                        if close_evt:
-                            yield close_evt
-                        
-                        current_block_index += 1
-                        current_block_type = "thinking"
-                        current_thinking_signature = thoughtsignature
-                        
-                        block_new: Dict[str, Any] = {"type": "thinking", "thinking": ""}
-                        if thoughtsignature:
-                            block_new["thoughtSignature"] = thoughtsignature
-                        
-                        yield _sse_event(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": current_block_index,
-                                "content_block": block_new,
-                            },
-                        )
+async def aggregate_gemini_to_anthropic(stream, model: str, tool_names=None, display_thinking=True, signature_encoder=None, function_encoder=None):
+    state = AnthropicStreamState(model, tool_names, display_thinking, signature_encoder, function_encoder)
+    events = iter_gemini_stream_events(stream)
+    try:
+        async for data in events:
+            if isinstance(data, Response):
+                raise AnthropicStreamError("Upstream request failed", data.status_code if data.status_code >= 400 else 502)
+            state.feed(data)
+        return state.response()
+    finally:
+        await close_async_iterator(events)
 
-                    # 发送 thinking 文本增量
-                    if thinking_text:
-                        yield _sse_event(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "thinking_delta", "thinking": thinking_text},
-                            },
-                        )
-                    continue
 
-                # 处理文本块
-                if "text" in part:
-                    if (
-                        is_skip_thought_signature_placeholder(part)
-                        or is_internal_placeholder_text(part.get("text"))
-                    ):
-                        continue
-                    text = part.get("text", "")
-                    if isinstance(text, str) and not text.strip():
-                        continue
-
-                    if current_block_type != "text":
-                        close_evt = _close_block()
-                        if close_evt:
-                            yield close_evt
-
-                        current_block_index += 1
-                        current_block_type = "text"
-
-                        yield _sse_event(
-                            "content_block_start",
-                            {
-                                "type": "content_block_start",
-                                "index": current_block_index,
-                                "content_block": {"type": "text", "text": ""},
-                            },
-                        )
-
-                    if text:
-                        yield _sse_event(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": current_block_index,
-                                "delta": {"type": "text_delta", "text": text},
-                            },
-                        )
-                    continue
-
-                # 处理工具调用
-                if "functionCall" in part:
-                    close_evt = _close_block()
-                    if close_evt:
-                        yield close_evt
-
-                    has_tool_use = True
-                    fc = part.get("functionCall", {}) or {}
-                    original_id = fc.get("id") or f"toolu_{uuid.uuid4().hex}"
-                    tool_id = original_id
-                    tool_name = fc.get("name") or ""
-                    tool_args = _remove_nulls_for_tool_input(fc.get("args", {}) or {})
-
-                    if _anthropic_debug_enabled():
-                        log.info(
-                            f"[ANTHROPIC][tool_use] 处理工具调用: name={tool_name}, "
-                            f"id={tool_id}"
-                        )
-
-                    current_block_index += 1
-                    # 注意：工具调用不设置 current_block_type，因为它是独立完整的块
-
-                    yield _sse_event(
-                        "content_block_start",
-                        {
-                            "type": "content_block_start",
-                            "index": current_block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": tool_name,
-                                "input": {},
-                            },
-                        },
-                    )
-
-                    input_json = json.dumps(tool_args, ensure_ascii=False, separators=(",", ":"))
-                    yield _sse_event(
-                        "content_block_delta",
-                        {
-                            "type": "content_block_delta",
-                            "index": current_block_index,
-                            "delta": {"type": "input_json_delta", "partial_json": input_json},
-                        },
-                    )
-
-                    yield _sse_event(
-                        "content_block_stop",
-                        {"type": "content_block_stop", "index": current_block_index},
-                    )
-                    # 工具调用块已完全关闭，current_block_type 保持为 None
-                    
-                    if _anthropic_debug_enabled():
-                        log.info(f"[ANTHROPIC][tool_use] 工具调用块已关闭: index={current_block_index}")
-                    
-                    continue
-
-            # 检查是否结束
-            if candidate.get("finishReason"):
-                finish_reason = candidate.get("finishReason")
-                # 不 break：继续消费上游残余块（如 [DONE]），保证底层
-                # stream_request 走正常收尾路径记录请求日志（issue #438）
-                stream_finished = True
-
-        # 关闭最后的内容块
-        close_evt = _close_block()
-        if close_evt:
-            yield close_evt
-
-        # 确定停止原因
-        # 只有在正常停止（STOP）且有工具调用时才设为 tool_use
-        # 避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_use 导致循环
-        if has_tool_use and finish_reason == "STOP":
-            stop_reason = "tool_use"
-        elif finish_reason == "MAX_TOKENS":
-            stop_reason = "max_tokens"
-        else:
-            # 其他情况（SAFETY、RECITATION 等）默认为 end_turn
-            stop_reason = "end_turn"
-
-        if _anthropic_debug_enabled():
-            log.info(
-                f"[ANTHROPIC][stream_end] 流式结束: stop_reason={stop_reason}, "
-                f"has_tool_use={has_tool_use}, finish_reason={finish_reason}, "
-                f"input_tokens={input_tokens}, output_tokens={output_tokens}"
-            )
-
-        # 发送 message_delta 和 message_stop
-        yield _sse_event(
-            "message_delta",
-            {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": _usage_payload(),
-            },
-        )
-
-        yield _sse_event("message_stop", {"type": "message_stop"})
-
-    except Exception as e:
-        log.error(f"[ANTHROPIC] 流式转换失败: {e}")
-        # 发送错误事件
-        if not message_start_sent:
-            yield _sse_event(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": _usage_payload(),
-                    },
-                },
-            )
-        yield _sse_event(
-            "error",
-            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
-        )
+async def gemini_stream_to_anthropic_stream(gemini_stream: AsyncIterator[bytes], model: str, status_code: int = 200,
+                                           tool_names=None, display_thinking=True, signature_encoder=None, function_encoder=None) -> AsyncIterator[bytes]:
+    if not 200 <= status_code < 300:
+        try:
+            async for chunk in gemini_stream:
+                yield chunk
+        finally:
+            await close_async_iterator(gemini_stream)
+        return
+    state = AnthropicStreamState(model, tool_names, display_thinking, signature_encoder, function_encoder)
+    events = iter_gemini_stream_events(gemini_stream)
+    try:
+        async for data in events:
+            if isinstance(data, Response):
+                raise AnthropicStreamError("Upstream request failed", data.status_code)
+            for event in state.feed(data):
+                yield event
+        for event in state.finish():
+            yield event
+    except Exception as error:
+        log.error(f"[ANTHROPIC] Stream conversion failed: {type(error).__name__}")
+        for event in state.start():
+            yield event
+        for event in state.close_block():
+            yield event
+        message = str(error) if isinstance(error, AnthropicStreamError) else "Upstream stream failed"
+        yield _sse_event("error", {"type": "error", "error": {"type": "api_error", "message": message}})
+    finally:
+        await close_async_iterator(events)
+        await close_async_iterator(gemini_stream)

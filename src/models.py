@@ -6,7 +6,7 @@
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, StrictBool, model_validator
 
 
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
@@ -30,9 +30,12 @@ class ModelList(BaseModel):
 # ==================== OpenAI 请求 ====================
 
 class OpenAIToolFunction(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[StrictBool] = None
 
 
 class OpenAIToolCallFunction(BaseModel):
@@ -82,16 +85,45 @@ class OpenAIChatMessage(BaseModel):
         return self
 
 
+class OpenAIStreamOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    include_usage: Optional[StrictBool] = None
+    include_obfuscation: Optional[StrictBool] = None
+
+
 class OpenAIChatCompletionRequest(BaseModel):
+    # Retain SDK extensions for explicit capability reporting at the router.
+    # The router forwards only declared, implemented generation parameters.
+    model_config = ConfigDict(extra="allow")
+
     model: str
     messages: List[OpenAIChatMessage]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
+    top_k: Optional[int] = None
     max_tokens: Optional[int] = None
-    stream: bool = False
+    max_completion_tokens: Optional[int] = None
+    response_format: Optional[Dict[str, Any]] = None
+    n: Optional[int] = None
+    seed: Optional[int] = None
+    stream: Optional[StrictBool] = False
+    stream_options: Optional[OpenAIStreamOptions] = None
+    parallel_tool_calls: Optional[StrictBool] = None
+    reasoning_effort: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    store: Optional[StrictBool] = None
+    service_tier: Optional[str] = None
+    logprobs: Optional[StrictBool] = None
+    top_logprobs: Optional[int] = None
+    logit_bias: Optional[Dict[str, float]] = None
+    prompt_cache_key: Optional[str] = None
+    prompt_cache_retention: Optional[str] = None
+    safety_identifier: Optional[str] = None
+    verbosity: Optional[str] = None
     tools: Optional[List[OpenAITool]] = None
     tool_choice: Optional[Any] = None
-    stop: Optional[List[str]] = None
+    stop: Optional[str | List[str]] = None
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     user: Optional[str] = None
@@ -179,16 +211,20 @@ class ClaudeContentBlock(BaseModel):
     name: Optional[str] = None
     input: Optional[Dict[str, Any]] = None
     source: Optional[Dict[str, Any]] = None
-    thinking: Optional[Dict[str, Any]] = None
+    thinking: Optional[str] = None
     signature: Optional[str] = None
 
 
 class ClaudeMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
     content: Any
 
 
 class ClaudeTool(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None

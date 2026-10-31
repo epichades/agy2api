@@ -3,6 +3,7 @@
 """
 
 import asyncio
+import hmac
 import socket
 import threading
 import time
@@ -182,7 +183,7 @@ async def find_available_port(start_port: int = None) -> int:
     # 如果都不可用，让系统自动分配端口
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("0.0.0.0", 0))
+            s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
             log.info(f"系统分配可用端口: {port}")
             return port
@@ -194,8 +195,8 @@ async def find_available_port(start_port: int = None) -> int:
 def create_callback_server(port: int) -> HTTPServer:
     """创建指定端口的回调服务器，优化快速关闭"""
     try:
-        # 服务器监听0.0.0.0
-        server = HTTPServer(("0.0.0.0", port), AuthCallbackHandler)
+        # OAuth callback is local to the browser on this machine.
+        server = HTTPServer(("127.0.0.1", port), AuthCallbackHandler)
 
         # 设置socket选项以支持快速关闭
         server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -217,14 +218,14 @@ class AuthCallbackHandler(BaseHTTPRequestHandler):
         code = query_components.get("code", [None])[0]
         state = query_components.get("state", [None])[0]
 
-        log.info(f"收到OAuth回调: code={'已获取' if code else '未获取'}, state={state}")
+        log.info(f"收到OAuth回调: code={'已获取' if code else '未获取'}")
 
         if code and state and state in auth_flows:
             # 更新流程状态
             auth_flows[state]["code"] = code
             auth_flows[state]["completed"] = True
 
-            log.info(f"OAuth回调成功处理: state={state}")
+            log.info("OAuth回调成功处理")
 
             self.send_response(200)
             self.send_header("Content-type", "text/html")
@@ -279,11 +280,9 @@ async def create_auth_url(
             redirect_uri=callback_url,
         )
 
-        # 生成状态标识符，包含用户会话信息
-        if user_session:
-            state = f"{user_session}_{str(uuid.uuid4())}"
-        else:
-            state = str(uuid.uuid4())
+        # OAuth state is sent through the browser and provider: never embed a
+        # panel session or password in it. Session matching stays in auth_flows.
+        state = str(uuid.uuid4())
 
         # 生成认证URL
         auth_url = flow.get_auth_url(state=state)
@@ -300,10 +299,10 @@ async def create_auth_url(
                     port = old_flow.get("callback_port")
                     async_shutdown_server(server, port)
             except Exception as e:
-                log.warning(f"Failed to cleanup old auth flow {oldest_state}: {e}")
+                log.warning("Failed to cleanup old auth flow")
 
             del auth_flows[oldest_state]
-            log.debug(f"Removed oldest auth flow: {oldest_state}")
+            log.debug("Removed oldest auth flow")
 
         # 保存流程状态
         auth_flows[state] = {
@@ -323,7 +322,7 @@ async def create_auth_url(
         # 清理过期的流程（30分钟）
         cleanup_expired_flows()
 
-        log.info(f"OAuth流程已创建: state={state}, project_id={project_id}")
+        log.info("OAuth流程已创建")
         log.info(f"用户需要访问认证URL，然后OAuth会回调到 {callback_url}")
         log.info(f"为此认证流程分配的端口: {callback_port}")
 
@@ -373,10 +372,10 @@ async def _save_antigravity_credential(
         antigravity_url
     )
     if project_id:
-        log.info(f"成功从API获取project_id: {project_id}, tier: {subscription_tier}")
+        log.info("成功从API获取project_id和订阅等级")
     else:
         project_id = DEFAULT_PROJECT_ID
-        log.warning(f"无法从API获取project_id，使用默认project_id: {project_id}")
+        log.warning("无法从API获取project_id，使用默认project_id")
 
     # tier 获取失败时兜底为 free（避免 None 入库）
     if not subscription_tier:
@@ -420,7 +419,7 @@ async def _save_antigravity_credential(
 def wait_for_callback_sync(state: str, timeout: int = 300) -> Optional[str]:
     """同步等待OAuth回调完成，使用对应流程的专用服务器"""
     if state not in auth_flows:
-        log.error(f"未找到状态为 {state} 的认证流程")
+        log.error("未找到对应的认证流程")
         return None
 
     flow_data = auth_flows[state]
@@ -450,9 +449,7 @@ async def asyncio_complete_auth_flow(
 ) -> Dict[str, Any]:
     """异步完成认证流程（Antigravity模式）"""
     try:
-        log.info(
-            f"asyncio_complete_auth_flow开始执行: project_id={project_id}, user_session={user_session}"
-        )
+        log.info("asyncio_complete_auth_flow开始执行")
 
         # 查找对应的认证流程
         state = None
@@ -462,20 +459,20 @@ async def asyncio_complete_auth_flow(
 
         # 如果指定了project_id，先尝试匹配指定的项目
         if project_id:
-            log.info(f"尝试匹配指定的项目ID: {project_id}")
+            log.info("尝试匹配指定的项目ID")
             for s, data in auth_flows.items():
                 if data["project_id"] == project_id:
                     # 如果指定了用户会话，优先匹配相同会话的流程
                     if user_session and data.get("user_session") == user_session:
                         state = s
                         flow_data = data
-                        log.info(f"找到匹配的用户会话: {s}")
+                        log.info("找到匹配的用户会话")
                         break
                     # 如果没有指定会话，或没找到匹配会话的流程，使用第一个匹配项目ID的
                     elif not state:
                         state = s
                         flow_data = data
-                        log.info(f"找到匹配的项目ID: {s}")
+                        log.info("找到匹配的项目ID")
 
         # 如果没有指定项目ID或没找到匹配的，查找需要自动检测项目ID的流程
         if not state:
@@ -492,7 +489,7 @@ async def asyncio_complete_auth_flow(
             if completed_flows:
                 completed_flows.sort(key=lambda x: x[2], reverse=True)  # 按时间倒序
                 state, flow_data, _ = completed_flows[0]
-                log.info(f"找到已完成的最新认证流程: {state}")
+                log.info("找到已完成的最新认证流程")
             else:
                 # 如果没有已完成的，找最新的未完成流程
                 pending_flows = []
@@ -506,14 +503,13 @@ async def asyncio_complete_auth_flow(
                 if pending_flows:
                     pending_flows.sort(key=lambda x: x[2], reverse=True)  # 按时间倒序
                     state, flow_data, _ = pending_flows[0]
-                    log.info(f"找到最新的待完成认证流程: {state}")
+                    log.info("找到最新的待完成认证流程")
 
         if not state or not flow_data:
-            log.error(f"未找到认证流程: state={state}, flow_data存在={bool(flow_data)}")
-            log.debug(f"当前所有flow_data: {list(auth_flows.keys())}")
+            log.error("未找到认证流程")
             return {"success": False, "error": "未找到对应的认证流程，请先点击获取认证链接"}
 
-        log.info(f"找到认证流程: state={state}")
+        log.info("找到认证流程")
 
         # 检查是否已经有授权码
         log.info("开始检查OAuth授权码...")
@@ -548,27 +544,25 @@ async def asyncio_complete_auth_flow(
         flow = flow_data["flow"]
         auth_code = flow_data["code"]
 
-        log.info(f"开始使用授权码获取凭证: code={'***' + auth_code[-4:] if auth_code else 'None'}")
+        log.info("开始使用授权码获取凭证")
 
         # 使用认证代码获取凭证
         with _patch_oauthlib_validation():
             try:
                 log.info("调用flow.exchange_code...")
                 credentials = await flow.exchange_code(auth_code)
-                log.info(
-                    f"成功获取凭证，token前缀: {credentials.access_token[:20] if credentials.access_token else 'None'}..."
-                )
+                log.info("成功获取凭证")
 
                 # Antigravity模式：获取project_id并保存凭证
                 return await _save_antigravity_credential(credentials, state, flow_data)
 
             except Exception as e:
-                log.error(f"获取凭证失败: {e}")
-                return {"success": False, "error": f"获取凭证失败: {str(e)}"}
+                log.error(f"获取凭证失败: {type(e).__name__}")
+                return {"success": False, "error": "获取凭证失败"}
 
     except Exception as e:
-        log.error(f"异步完成认证流程失败: {e}")
-        return {"success": False, "error": str(e)}
+        log.error(f"异步完成认证流程失败: {type(e).__name__}")
+        return {"success": False, "error": "认证流程失败"}
 
 
 async def complete_auth_flow_from_callback_url(
@@ -576,7 +570,7 @@ async def complete_auth_flow_from_callback_url(
 ) -> Dict[str, Any]:
     """从回调URL直接完成认证流程，无需启动本地服务器（Antigravity模式）"""
     try:
-        log.info(f"开始从回调URL完成认证: {callback_url}")
+        log.info("开始从回调URL完成认证")
 
         # 解析回调URL
         parsed_url = urlparse(callback_url)
@@ -589,19 +583,19 @@ async def complete_auth_flow_from_callback_url(
         state = query_params["state"][0]
         code = query_params["code"][0]
 
-        log.info(f"从URL解析到: state={state}, code=xxx...")
+        log.info("已从URL解析认证参数")
 
         # 检查是否有对应的认证流程
         if state not in auth_flows:
             return {
                 "success": False,
-                "error": f"未找到对应的认证流程，请先启动认证 (state: {state})",
+                "error": "未找到对应的认证流程，请先启动认证",
             }
 
         flow_data = auth_flows[state]
         flow = flow_data["flow"]
 
-        log.info(f"使用redirect_uri: {flow.redirect_uri}")
+        log.info("已找到对应的OAuth流程")
 
         try:
             # 使用authorization code获取token
@@ -612,12 +606,12 @@ async def complete_auth_flow_from_callback_url(
             return await _save_antigravity_credential(credentials, state, flow_data)
 
         except Exception as e:
-            log.error(f"从回调URL获取凭证失败: {e}")
-            return {"success": False, "error": f"获取凭证失败: {str(e)}"}
+            log.error(f"从回调URL获取凭证失败: {type(e).__name__}")
+            return {"success": False, "error": "获取凭证失败"}
 
     except Exception as e:
-        log.error(f"从回调URL完成认证流程失败: {e}")
-        return {"success": False, "error": str(e)}
+        log.error(f"从回调URL完成认证流程失败: {type(e).__name__}")
+        return {"success": False, "error": "认证流程失败"}
 
 
 def async_shutdown_server(server, port):
@@ -677,4 +671,9 @@ def get_auth_status(project_id: str) -> Dict[str, Any]:
 async def verify_password(password: str) -> bool:
     """验证密码（面板登录使用）"""
     correct_password = await get_panel_password()
-    return password == correct_password
+    if not correct_password:
+        return False
+    try:
+        return hmac.compare_digest(password.encode("utf-8"), correct_password.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False

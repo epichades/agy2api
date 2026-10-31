@@ -1,8 +1,51 @@
 import { Loader2, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Modal from "../components/Modal";
 import Select from "../components/Select";
 import api from "../api";
+
+// 错误码输入：编辑期间保留原始文本，仅在按键时把已解析的数组回写配置（保证保存时取到最新值），
+// 失焦时再归一化显示。原实现在每次按键即时解析并回写数组，导致分隔符与未成形的中间输入被即时
+// 过滤/截断，无法输入多个错误码，也无法输入小于 100 的中间数字。
+function CsvNumbersField({ value, onChange, placeholder }) {
+  const toText = (v) => (Array.isArray(v) ? v.join(", ") : (v ?? ""));
+  const [text, setText] = useState(() => toText(value));
+  const focusedRef = useRef(false);
+
+  // 仅在非编辑态（失焦）时同步外部配置变化，避免编辑过程中被即时覆盖
+  useEffect(() => {
+    if (!focusedRef.current) setText(toText(value));
+  }, [value]);
+
+  const commitText = (raw) => {
+    const nums = raw
+      .split(/[,\s]+/)
+      .map((x) => parseInt(x, 10))
+      .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
+    onChange([...new Set(nums)].sort((a, b) => a - b));
+  };
+
+  return (
+    <input
+      type="text"
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        commitText(raw);
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        commitText(text);
+      }}
+      placeholder={placeholder}
+      className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
+    />
+  );
+}
 
 const CONFIG_GROUPS = [
   {
@@ -10,8 +53,8 @@ const CONFIG_GROUPS = [
     fields: [
       { key: "host", label: "服务器主机地址", type: "text", note: "服务器监听的主机地址，0.0.0.0表示监听所有接口（重启生效）" },
       { key: "port", label: "服务器端口", type: "number", note: "服务器监听的端口号（重启生效）" },
-      { key: "api_password", label: "API 访问密码", type: "text", note: "聊天API访问密码，用于 OpenAI / Gemini / Claude 端点认证" },
-      { key: "panel_password", label: "控制面板密码", type: "text", note: "控制面板访问密码" },
+      { key: "api_password", label: "API 访问密码", type: "password", note: "聊天API访问密码，用于 OpenAI / Gemini / Claude 端点认证" },
+      { key: "panel_password", label: "控制面板密码", type: "password", note: "控制面板访问密码" },
     ],
   },
   {
@@ -25,7 +68,7 @@ const CONFIG_GROUPS = [
     title: "基础配置",
     fields: [
       { key: "credentials_dir", label: "凭证目录路径", type: "text", note: "存储认证文件的目录路径" },
-      { key: "proxy", label: "代理设置", type: "text", note: "支持 http/https/socks5/socks5h，可带账号密码（user:pass@host:port），留空不使用（重启生效）", placeholder: "http://user:pass@proxy:port 或 socks5h://proxy:port" },
+      { key: "proxy", label: "代理设置", type: "password", note: "支持 http/https/socks5/socks5h，可带账号密码（user:pass@host:port），留空不使用（重启生效）", placeholder: "http://user:pass@proxy:port 或 socks5h://proxy:port" },
     ],
   },
   {
@@ -116,6 +159,7 @@ const CONFIG_GROUPS = [
 
 export default function Config() {
   const [config, setConfig] = useState({});
+  const [privateConfigured, setPrivateConfigured] = useState({});
   const [envLocked, setEnvLocked] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -130,6 +174,7 @@ export default function Config() {
     try {
       const res = await api.get("/config/get");
       setConfig(res.data.config || {});
+      setPrivateConfigured(res.data.private_configured || {});
       setEnvLocked(res.data.env_locked || []);
       if (!silent) setMessage(null);
     } catch (err) {
@@ -157,29 +202,12 @@ export default function Config() {
     setConfig((prev) => ({ ...prev, [key]: value }));
   };
 
-  // 一键镜像/官方端点（墙内访问 Google 官方端点的反代方案）
-  const MIRROR_BASE = "https://gcli-api.sukaka.top";
+  // Restore the service endpoints without selecting a third-party credential relay.
   const OFFICIAL_ENDPOINTS = {
     oauth_proxy_url: "https://oauth2.googleapis.com",
     googleapis_proxy_url: "https://www.googleapis.com",
     antigravity_api_url: "https://daily-cloudcode-pa.googleapis.com",
   };
-  const MIRROR_PATHS = {
-    oauth_proxy_url: "/oauth2",
-    googleapis_proxy_url: "/googleapis",
-    antigravity_api_url: "/daily-cloudcode-pa",
-  };
-
-  const useMirrorUrls = () => {
-    setConfig((prev) => {
-      const next = { ...prev };
-      for (const [key, path] of Object.entries(MIRROR_PATHS)) {
-        if (!envLocked.includes(key)) next[key] = MIRROR_BASE + path;
-      }
-      return next;
-    });
-  };
-
   const restoreOfficialUrls = () => {
     setConfig((prev) => {
       const next = { ...prev };
@@ -243,20 +271,11 @@ export default function Config() {
     }
 
     if (field.type === "csv_numbers") {
-      const text = Array.isArray(value) ? value.join(", ") : value || "";
       return (
-        <input
-          type="text"
-          value={text}
-          onChange={(e) => {
-            const nums = e.target.value
-              .split(/[,\s]+/)
-              .map((x) => parseInt(x, 10))
-              .filter((n) => Number.isInteger(n) && n >= 100 && n <= 599);
-            setField(field.key, [...new Set(nums)]);
-          }}
+        <CsvNumbersField
+          value={value}
+          onChange={(v) => setField(field.key, v)}
           placeholder={field.placeholder}
-          className="w-full sm:w-64 px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500 font-mono"
         />
       );
     }
@@ -347,7 +366,8 @@ export default function Config() {
             field.type === "number" ? Number(e.target.value) : e.target.value
           )
         }
-        placeholder={field.placeholder}
+        placeholder={field.type === "password" && privateConfigured[field.key]
+          ? "已設定；輸入新值可更新" : field.placeholder}
         className="w-full px-3 py-2 bg-dark-800 border border-dark-600 rounded-lg text-sm text-white placeholder-gray-500"
       />
     );
@@ -398,13 +418,6 @@ export default function Config() {
 
               {group.title === "端点配置" && (
                 <div className="flex flex-wrap gap-2 mb-4">
-                  <button
-                    type="button"
-                    onClick={useMirrorUrls}
-                    className="btn btn-secondary text-xs px-3 py-1.5"
-                  >
-                    🚀 一键使用镜像网址
-                  </button>
                   <button
                     type="button"
                     onClick={restoreOfficialUrls}

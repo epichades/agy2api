@@ -7,10 +7,11 @@
 """
 
 import json
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, Optional
 
 import httpx
+from anyio import CancelScope
 from fastapi import Response
 
 from config import get_proxy_config
@@ -53,10 +54,11 @@ async def get_streaming_client(
         yield client
     finally:
         # 确保无论发生什么都关闭客户端
-        try:
-            await client.aclose()
-        except Exception as e:
-            log.warning(f"Error closing streaming client: {e}")
+        with CancelScope(shield=True):
+            try:
+                await client.aclose()
+            except Exception as e:
+                log.warning(f"Error closing streaming client: {type(e).__name__}")
 
 
 # 通用的异步方法
@@ -101,7 +103,9 @@ async def stream_post_async(
         return
 
     async with get_streaming_client(**kwargs) as client:
-        async with client.stream("POST", url, json=body, headers=headers) as r:
+        contexts = AsyncExitStack()
+        try:
+            r = await contexts.enter_async_context(client.stream("POST", url, json=body, headers=headers))
             # 错误直接返回
             if r.status_code != 200:
                 yield Response(await r.aread(), r.status_code, dict(r.headers))
@@ -115,3 +119,7 @@ async def stream_post_async(
                 # 通过aiter_lines转化成str流返回
                 async for line in r.aiter_lines():
                     yield line
+        finally:
+            # Response.aclose may await connection-pool cleanup under an ASGI cancel scope.
+            with CancelScope(shield=True):
+                await contexts.aclose()

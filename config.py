@@ -2,8 +2,8 @@
 Configuration constants for the Geminicli2api proxy server.
 Centralizes all configuration to avoid duplication across modules.
 
-- 启动时加载一次配置到内存
-- 修改配置时调用 reload_config() 重新从数据库加载
+- 启动成功后才标记配置就绪，失败可以重试
+- 有持久存储来源时读取当前数据库值，避免旧密码／设定快取
 """
 
 import ipaddress
@@ -17,6 +17,7 @@ from log import log
 # 全局配置缓存
 _config_cache: dict[str, Any] = {}
 _config_initialized = False
+_config_source = None
 
 # Client Configuration
 
@@ -58,63 +59,70 @@ ENV_MAPPINGS = {
 
 # ====================== 配置系统 ======================
 
-async def init_config():
-    """初始化配置缓存（启动时调用一次）"""
-    global _config_cache, _config_initialized
+def clear_config_cache() -> None:
+    """Forget a closed/failed store; a later initialization must really retry."""
+    global _config_cache, _config_initialized, _config_source
+    _config_cache = {}
+    _config_initialized = False
+    _config_source = None
 
+
+async def init_config() -> bool:
+    """Initialize atomically; a transient failure must not cache success/defaults."""
+    global _config_cache, _config_initialized, _config_source
     if _config_initialized:
-        return
-
+        return True
     try:
         from src.storage.database import get_database
         database = await get_database()
-        _config_cache = await database.get_all_config()
-        _config_initialized = True
-    except Exception:
-        # 初始化失败时使用空缓存
-        _config_cache = {}
-        _config_initialized = True
+        values = await database.get_all_config()
+    except Exception as error:
+        clear_config_cache()
+        log.error(f"Configuration initialization failed: {type(error).__name__}")
+        return False
+    _config_cache = values
+    _config_source = database
+    _config_initialized = True
+    return True
 
 
-async def reload_config():
-    """重新加载配置（修改配置后调用）"""
-    global _config_cache, _config_initialized
-
+async def reload_config() -> None:
+    """Refresh persisted values, without hiding a failed save/reload."""
+    global _config_cache, _config_initialized, _config_source
     try:
         from src.storage.database import get_database
         database = await get_database()
-
-        # 重新加载数据库配置缓存
         await database.reload_config_cache()
-
-        # 重新加载配置缓存
-        _config_cache = await database.get_all_config()
-        _config_initialized = True
+        values = await database.get_all_config()
     except Exception:
-        pass
+        clear_config_cache()
+        raise RuntimeError("Configuration store unavailable") from None
+    _config_cache = values
+    _config_source = database
+    _config_initialized = True
 
 
 def _get_cached_config(key: str, default: Any = None) -> Any:
-    """从内存缓存获取配置（同步）"""
     return _config_cache.get(key, default)
 
 
 async def get_config_value(key: str, default: Any = None, env_var: Optional[str] = None) -> Any:
-    """Get configuration value with priority: ENV > Storage > default."""
-    # 确保配置已初始化
-    if not _config_initialized:
-        await init_config()
-
-    # Priority 1: Environment variable
+    """ENV > current persisted configuration > defaults; never trust stale auth."""
+    global _config_cache
     if env_var and os.getenv(env_var):
         return os.getenv(env_var)
-
-    # Priority 2: Memory cache
+    if not _config_initialized and not await init_config():
+        raise RuntimeError("Configuration store unavailable")
+    # Each initialized process reads current DB state. Database.get_all_config
+    # queries the store rather than its process cache, including deletions.
+    if _config_source is not None:
+        try:
+            _config_cache = await _config_source.get_all_config()
+        except Exception:
+            clear_config_cache()
+            raise RuntimeError("Configuration store unavailable") from None
     value = _get_cached_config(key)
-    if value is not None:
-        return value
-
-    return default
+    return default if value is None else value
 
 
 # Configuration getters - all async
@@ -226,9 +234,9 @@ async def get_server_host() -> str:
 
     Environment variable: HOST
     Database config key: host
-    Default: 0.0.0.0
+    Default: 127.0.0.1
     """
-    return str(await get_config_value("host", "0.0.0.0", "HOST"))
+    return str(await get_config_value("host", "127.0.0.1", "HOST"))
 
 
 async def get_server_port() -> int:
@@ -255,9 +263,9 @@ async def get_api_password() -> str:
 
     Environment variable: API_PASSWORD
     Database config key: api_password
-    Default: pwd
+    Default: unset (authentication disabled until configured)
     """
-    return str(await get_config_value("api_password", "pwd", "API_PASSWORD"))
+    return str(await get_config_value("api_password", "", "API_PASSWORD"))
 
 
 async def get_panel_password() -> str:
@@ -266,9 +274,9 @@ async def get_panel_password() -> str:
 
     Environment variable: PANEL_PASSWORD
     Database config key: panel_password
-    Default: pwd
+    Default: unset (authentication disabled until configured)
     """
-    return str(await get_config_value("panel_password", "pwd", "PANEL_PASSWORD"))
+    return str(await get_config_value("panel_password", "", "PANEL_PASSWORD"))
 
 
 async def get_credentials_dir() -> str:

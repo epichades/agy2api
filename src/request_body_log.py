@@ -20,7 +20,11 @@ from log import log
 REQUEST_LOG_DIR = os.path.join("data", "request_logs")
 
 # 记录时需要脱敏的请求头（小写）
-_SENSITIVE_HEADERS = {"authorization", "cookie", "set-cookie", "x-goog-api-key", "x-api-key"}
+_SENSITIVE_HEADERS = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-goog-api-key", "x-api-key", "access_token",
+    "x-anthropic-auth-token", "anthropic-auth-token",
+}
 
 
 def _sanitize_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:

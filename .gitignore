@@ -12,10 +12,51 @@ GEMINI.md
 .kiro
 # Environment configuration
 .env
+.env.*
+!.env.example
+
+# Local databases, exports, and private key material
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.pem
+*.key
+*.p12
+*.pfx
+request_logs/
+.codex/
+.agents/
+.aws/
+.ssh/
+.config/
+.kube/
+.npmrc
+.pypirc
+.netrc
+.yarnrc
+.yarnrc.*
+.docker/config.json
+id_rsa
+id_ed25519
+*.asc
+*.gpg
+
+# New diagnostic notes and generated assets must be reviewed before sharing.
+src/**/*.txt
+docs/**/*.txt
+dist/*
+!dist/index.html
+!dist/favicon.ico
+!dist/favicon-32.png
+!dist/assets/
+dist/assets/*
+!dist/assets/index-*.js
+!dist/assets/index-*.css
 
 # Python
-uv.lock
-.python-version
 __pycache__/
 *.py[cod]
 *$py.class
@@ -23,8 +64,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-!dist/
-!dist/**
 downloads/
 eggs/
 .eggs/
@@ -94,7 +133,25 @@ Thumbs.db
 
 # Logs
 *.log
+*.log.*
 log.txt
+/log.txt*
+
+# Private deployment notes and portable copies may contain credentials/history.
+*.private.md
+backups/
+backup/
+*.bundle
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tbz2
+*.tar.xz
+*.txz
+*.7z
+*.rar
 
 # Temporary files
 *.tmp

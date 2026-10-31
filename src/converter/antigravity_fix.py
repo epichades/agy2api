@@ -6,14 +6,15 @@ Antigravity Format Utilities - 独立的 Antigravity 请求处理和转换工具
   * 所有模型禁用预填充 (profile.no_prefill 恒为 True)
   * 不修改调用方传入的 request (generationConfig / thinkingConfig / contents 均先复制)
 ────────────────────────────────────────────────────────────────
-按项目要求:
-- 使用 print 输出 warning/error，去掉 debug 日志
+转换过程使用统一日志接口，避免直接打印用户内容。
 """
 import json
 import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+from log import log
 
 from config import (
     apply_sensitive_word_filter,
@@ -23,6 +24,12 @@ from config import (
     rewrite_model_name,
 )
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+
+
+
+def _privacy_print(message: str, *, flush: bool = False) -> None:
+    """Keep conversion diagnostics behind the application's log policy."""
+    log.info(message)
 
 # ==================== 常量配置 ====================
 
@@ -323,41 +330,30 @@ def _ensure_empty_tool_schema_for_claude(tools: Any, model_name: str) -> Any:
             if not isinstance(tool, dict):
                 normalized_tools.append(tool)
                 continue
-
-            normalized_tool = tool.copy()
-
-            schema = {"type": "object", "properties": {}}
-            name = ""
-            description = ""
-
-            # Extract schema from either format
-            custom_tool = normalized_tool.get("custom")
-            if isinstance(custom_tool, dict):
-                schema = custom_tool.get("input_schema") or custom_tool.get("inputSchema") or schema
-                name = custom_tool.get("name", "")
-                description = custom_tool.get("description", "")
-            else:
-                declarations = normalized_tool.get("functionDeclarations") or normalized_tool.get("function_declarations")
-                if isinstance(declarations, list) and declarations and isinstance(declarations[0], dict):
-                    decl = declarations[0]
-                    schema = (
-                        decl.get("parametersJsonSchema") or
-                        decl.get("parameters_json_schema") or
-                        decl.get("parameters") or schema
-                    )
-                    name = decl.get("name", "")
-                    description = decl.get("description", "")
-
-            # For ALL Claude models, try outputting functionDeclarations with parameters!
-            # If Google's backend expects parameters to translate to input_schema, this will fix the Field required error.
-            normalized_tools.append({
-                "functionDeclarations": [{
-                    "name": name,
-                    "description": description,
-                    "parameters": schema
+            custom = tool.get("custom")
+            if isinstance(custom, dict):
+                declarations = [{
+                    "name": custom.get("name", ""),
+                    "description": custom.get("description", ""),
+                    "parameters": custom.get("input_schema") or custom.get("inputSchema"),
                 }]
-            })
-
+            else:
+                declarations = tool.get("functionDeclarations") or tool.get("function_declarations")
+            if not isinstance(declarations, list):
+                normalized_tools.append(tool.copy())
+                continue
+            for declaration in declarations:
+                if not isinstance(declaration, dict):
+                    raise ValueError("Tool declaration must be an object")
+                schema = (declaration.get("parametersJsonSchema")
+                          or declaration.get("parameters_json_schema")
+                          or declaration.get("parameters")
+                          or {"type": "object", "properties": {}})
+                normalized_tools.append({"functionDeclarations": [{
+                    "name": declaration.get("name", ""),
+                    "description": declaration.get("description", ""),
+                    "parameters": schema,
+                }]})
         return normalized_tools
 
     # 对于 Gemini 模型：
@@ -438,8 +434,10 @@ def _should_skip_thought_signature(part: Dict[str, Any], model_name: str) -> boo
 
 def _normalize_part_thought_signature(part: Dict[str, Any], model_name: str) -> Dict[str, Any]:
     normalized = part.copy()
-    if _should_skip_thought_signature(normalized, model_name):
-        normalized.pop("thought_signature", None)
+    signature = normalized.pop("thought_signature", None)
+    if signature and not normalized.get("thoughtSignature"):
+        normalized["thoughtSignature"] = signature
+    if _should_skip_thought_signature(normalized, model_name) and not normalized.get("thoughtSignature"):
         normalized["thoughtSignature"] = SKIP_THOUGHT_SIGNATURE_VALIDATOR
     return normalized
 
@@ -575,7 +573,9 @@ def prepare_image_generation_request(
         if image_size:
             image_config["imageSize"] = image_size
 
-    request_body["model"] = IMAGE_BASE_MODEL  # 统一使用基础模型名
+    # [local patch] 不再把模型名改写为 IMAGE_BASE_MODEL：模型名必须是上游精确 ID，
+    # 非精确 ID 在路由层返回 404，而不是被静默替换。
+    request_body["model"] = model
     request_body["generationConfig"] = {
         "candidateCount": 1,
         "imageConfig": image_config
@@ -608,6 +608,13 @@ _UPSTREAM_ALIASES: Dict[str, str] = {
 async def _get_model_rewrite_rules():
     """读取生效的模型名复写规则；未启用时返回 None"""
     enabled, rules = await get_model_rewrite_filter()
+    # [local patch] 硬规则：响应模型必须等于请求模型，禁止静默改写。
+    # 仅当显式设置环境变量 ALLOW_MODEL_REWRITE=1 时才允许面板/环境配置的复写规则生效。
+    import os as _os
+    if enabled and rules and _os.getenv("ALLOW_MODEL_REWRITE") != "1":
+        from log import log
+        log.warning("[ANTIGRAVITY] 模型名复写规则已配置但被本地策略禁用（设置 ALLOW_MODEL_REWRITE=1 才生效）")
+        return None
     return rules if enabled and rules else None
 
 
@@ -637,12 +644,9 @@ def resolve_profile(model: str) -> ModelProfile:
         if "claude-opus-5-5" in normalized or "claude-sonnet-5-5" in normalized:
             return ModelProfile("claude", model, "route")
 
-        upstream = model
-        if "claude-opus-4-6" in lower:
-            upstream = "claude-opus-4-6-thinking"
-        elif "claude-sonnet-4-6-thinking" in lower:
-            upstream = "claude-sonnet-4-6"
-        return ModelProfile("claude", upstream, think)
+        # [local patch] 已移除 claude-opus-4-6 -> -thinking / claude-sonnet-4-6-thinking -> claude-sonnet-4-6 别名：
+        # 模型名原样透传，非上游精确 ID 在路由层返回 404。
+        return ModelProfile("claude", model, think)
 
     if "gemini-4" in lower:
         return ModelProfile("gemini4", _UPSTREAM_ALIASES.get(lower, model), "route")
@@ -749,15 +753,14 @@ def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
             if not isinstance(part, dict):
                 continue
 
-            # 必须先归一化 text（rstrip 可能把 "\n" 之类削成 ""）再做有效性校验，
-            # 否则纯空白 text 先通过校验、后变空串，发给上游会转成缺少 text 字段的
-            # text 块（Claude 报 messages.N.content.M.text.text: Field required）
+            # Whitespace is content, including inside a signed thinking block.
+            # Only a truly empty text field is removed below.
             if "text" in part:
                 part = part.copy()  # copy-on-write，避免原地修改调用方的 contents
                 text_value = part["text"]
                 if isinstance(text_value, list):
                     # 元素可能是 {"type":"text","text":"..."}，不能直接 str(dict)，否则会污染 model 历史
-                    print(f"[ANTIGRAVITY_FIX] text 字段是列表，自动合并: {text_value}", flush=True)
+                    _privacy_print("[ANTIGRAVITY_FIX] text 字段是列表，自动合并", flush=True)
                     text_parts = []
                     for t in text_value:
                         if isinstance(t, dict) and "text" in t:
@@ -768,12 +771,12 @@ def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
                             text_parts.append(str(t))
                     part["text"] = " ".join(text_parts)
                 elif isinstance(text_value, str):
-                    part["text"] = text_value.rstrip()
+                    part["text"] = text_value
                 else:
-                    print(f"[ANTIGRAVITY_FIX] text 字段类型异常 ({type(text_value)}), 转为字符串: {text_value}", flush=True)
+                    _privacy_print(f"[ANTIGRAVITY_FIX] text 字段类型异常 ({type(text_value).__name__})", flush=True)
                     part["text"] = str(text_value)
 
-                if part["text"] == "":
+                if part["text"] == "" and not part.get("thoughtSignature") and not part.get("thought_signature"):
                     # part 还有其他有效字段（如 functionCall）时仅去掉 text 字段
                     part.pop("text", None)
 
@@ -784,7 +787,7 @@ def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
                 if key != "thought"
             )
             if not has_valid_value:
-                print(f"[ANTIGRAVITY_FIX] 移除空的或无效的 part: {part}", flush=True)
+                _privacy_print("[ANTIGRAVITY_FIX] 移除空的或无效的 part", flush=True)
                 continue
 
             part = _normalize_part_thought_signature(part, model_name)
@@ -796,7 +799,7 @@ def _clean_contents(contents: List[Any], model_name: str) -> List[Any]:
             cleaned_content["parts"] = valid_parts
             cleaned_contents.append(cleaned_content)
         else:
-            print(f"[ANTIGRAVITY_FIX] 跳过没有有效 parts 的 content: {content.get('role')}", flush=True)
+            _privacy_print("[ANTIGRAVITY_FIX] 跳过没有有效 parts 的 content", flush=True)
     return cleaned_contents
 
 
@@ -811,35 +814,25 @@ def _strip_trailing_model_turns(contents: List[Any]) -> Tuple[List[Any], int]:
 
 
 def _prepare_claude_history(contents: List[Any], generation_config: Dict[str, Any]) -> List[Any]:
-    """
-    Claude 专属历史处理:
-    - 含工具调用 (MCP 场景): 移除 thinkingConfig，避免失效
-    - 否则: 给最后一条 model 消息补一个 thinking 块 (虚拟签名跳过验证)
-    """
-    has_tool_calls = any(
-        isinstance(content, dict)
-        and any(
-            isinstance(part, dict) and ("functionCall" in part or "function_call" in part)
-            for part in content.get("parts", []) or []
-        )
-        for content in contents
-    )
-    if has_tool_calls:
-        print("[ANTIGRAVITY] 检测到工具调用（MCP场景），移除 thinkingConfig 避免失效", flush=True)
-        generation_config.pop("thinkingConfig", None)
-        return contents
+    """Keep signed history and thinking config; remove only synthetic sentinels."""
+    from src.converter.thoughtSignature_fix import is_skip_thought_signature_placeholder
 
-    contents = list(contents)
-    for i in range(len(contents) - 1, -1, -1):
-        content = contents[i]
-        if isinstance(content, dict) and content.get("role") == "model":
-            parts = content.get("parts", []) or []
-            first = parts[0] if parts else None
-            if not (isinstance(first, dict) and ("thought" in first or "thoughtSignature" in first)):
-                thinking_part = {"text": "...", "thoughtSignature": _CLAUDE_THINKING_SIGNATURE}
-                contents[i] = {**content, "parts": [thinking_part] + list(parts)}
-            break
-    return contents
+    result = []
+    for content in contents:
+        if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+            result.append(content)
+            continue
+        parts = []
+        for part in content["parts"]:
+            if isinstance(part, dict) and is_skip_thought_signature_placeholder(part):
+                continue
+            if (isinstance(part, dict) and ("functionCall" in part or "function_call" in part)
+                    and part.get("thoughtSignature") == SKIP_THOUGHT_SIGNATURE_VALIDATOR):
+                part = {k: v for k, v in part.items() if k != "thoughtSignature"}
+            parts.append(part)
+        if parts:
+            result.append({**content, "parts": parts})
+    return result
 
 
 # ==================== 统一的 Antigravity 请求后处理 ====================
@@ -878,7 +871,7 @@ async def normalize_antigravity_request(
         rewritten = rewrite_model_name(model, rewrite_rules)
         if rewritten != model:
             result["model"] = rewritten
-            print(f"[ANTIGRAVITY] 模型名复写: {model} -> {rewritten}", flush=True)
+            _privacy_print("[ANTIGRAVITY] 模型名已复写", flush=True)
         model = rewritten
 
     profile = resolve_profile(model)
@@ -914,9 +907,8 @@ async def normalize_antigravity_request(
         contents = _clean_contents(result["contents"], upstream)
 
         if profile.no_prefill:
-            contents, removed = _strip_trailing_model_turns(contents)
-            if removed:
-                print(f"[ANTIGRAVITY] {upstream} 禁用预填充，移除了 {removed} 条末尾 model 消息", flush=True)
+            if contents and isinstance(contents[-1], dict) and contents[-1].get("role") == "model":
+                raise ValueError("Assistant prefill is unsupported; finish history with a user message or tool result")
 
         if profile.family == "claude":
             contents = _prepare_claude_history(contents, generation_config)
@@ -930,15 +922,14 @@ async def normalize_antigravity_request(
         result["tools"] = _ensure_empty_tool_schema_for_claude(tools, upstream)
 
     # ========== 公共处理 ==========
-    generation_config.pop("presencePenalty", None)
-    generation_config.pop("frequencyPenalty", None)
-    generation_config.pop("stopSequences", None)
-
-    result["safetySettings"] = DEFAULT_SAFETY_SETTINGS
+    result.setdefault("safetySettings", DEFAULT_SAFETY_SETTINGS)
 
     if generation_config:
-        generation_config["maxOutputTokens"] = MAX_OUTPUT_TOKENS
-        generation_config["topK"] = TOP_K
+        requested_limit = generation_config.get("maxOutputTokens", MAX_OUTPUT_TOKENS)
+        if not isinstance(requested_limit, int) or isinstance(requested_limit, bool) or requested_limit <= 0:
+            raise ValueError("maxOutputTokens must be a positive integer")
+        generation_config["maxOutputTokens"] = min(requested_limit, MAX_OUTPUT_TOKENS)
+        generation_config.setdefault("topK", TOP_K)
         result["generationConfig"] = generation_config
 
     return result

@@ -19,7 +19,8 @@ from src.models import (
     AuthCallbackRequest,
     AuthCallbackUrlRequest,
 )
-from src.utils import verify_panel_token
+from src.utils import create_panel_token, verify_panel_token
+from config import get_panel_password
 
 
 # 创建路由器
@@ -28,18 +29,21 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 @router.post("/login")
 async def login(request: LoginRequest):
-    """用户登录（简化版：直接返回密码作为token）"""
+    """用户登录后签发有期限的面板会话令牌。"""
     try:
         if await verify_password(request.password):
-            # 直接使用密码作为token，简化认证流程
-            return JSONResponse(content={"token": request.password, "message": "登录成功"})
+            session_token = create_panel_token(await get_panel_password())
+            return JSONResponse(
+                content={"token": session_token, "message": "登录成功"},
+                headers={"Cache-Control": "no-store"},
+            )
         else:
             raise HTTPException(status_code=401, detail="密码错误")
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"登录失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"登录失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="登录失败")
 
 
 @router.post("/start")
@@ -72,8 +76,8 @@ async def start_auth(request: AuthStartRequest, token: str = Depends(verify_pane
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"开始认证流程失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"开始认证流程失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="开始认证流程失败")
 
 
 @router.post("/callback")
@@ -99,7 +103,8 @@ async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verif
                     "tier": result.get("tier"),
                     "message": "认证成功，凭证已保存",
                     "auto_detected_project": result.get("auto_detected_project", False),
-                }
+                },
+                headers={"Cache-Control": "no-store"},
             )
         else:
             # 如果需要手动项目ID或项目选择，在响应中标明
@@ -125,8 +130,8 @@ async def auth_callback(request: AuthCallbackRequest, token: str = Depends(verif
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"处理认证回调失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"处理认证回调失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="处理认证回调失败")
 
 
 @router.post("/callback-url")
@@ -151,7 +156,8 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
                     "tier": result.get("tier"),
                     "message": "从回调URL认证成功，凭证已保存",
                     "auto_detected_project": result.get("auto_detected_project", False),
-                }
+                },
+                headers={"Cache-Control": "no-store"},
             )
         else:
             # 处理各种错误情况
@@ -175,8 +181,8 @@ async def auth_callback_url(request: AuthCallbackUrlRequest, token: str = Depend
     except HTTPException:
         raise
     except Exception as e:
-        log.error(f"从回调URL处理认证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"从回调URL处理认证失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="从回调URL处理认证失败")
 
 
 @router.get("/status/{project_id}")
@@ -190,5 +196,5 @@ async def check_auth_status(project_id: str, token: str = Depends(verify_panel_t
         return JSONResponse(content=status)
 
     except Exception as e:
-        log.error(f"检查认证状态失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"检查认证状态失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")

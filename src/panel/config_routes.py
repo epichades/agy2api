@@ -18,6 +18,18 @@ from .utils import get_env_locked_keys
 # 创建路由器
 router = APIRouter(prefix="/config", tags=["config"])
 
+# Passwords and authenticated proxy URLs are persisted, but never echoed on save.
+_PRIVATE_CONFIG_KEYS = {"api_password", "panel_password", "proxy"}
+_PRIVATE_KEY_PATTERN = re.compile(
+    r"(?:password|secret|token|credential|api[_-]?key|"
+    r"(?:redis|postgres|mysql|database|mongo|amqp)[_-]?(?:url|uri)|(?:^|_)uri$)",
+    re.IGNORECASE,
+)
+
+
+def _is_private_config_key(key: str) -> bool:
+    return key in _PRIVATE_CONFIG_KEYS or bool(_PRIVATE_KEY_PATTERN.search(key))
+
 
 @router.get("/get")
 async def get_config(token: str = Depends(verify_panel_token)):
@@ -93,11 +105,26 @@ async def get_config(token: str = Depends(verify_panel_token)):
             if key not in env_locked_keys:
                 current_config[key] = value
 
-        return JSONResponse(content={"config": current_config, "env_locked": list(env_locked_keys)})
+        private_configured = {
+            key: bool(value) for key, value in current_config.items()
+            if _is_private_config_key(key)
+        }
+        public_config = {
+            key: value for key, value in current_config.items()
+            if not _is_private_config_key(key)
+        }
+        return JSONResponse(
+            content={
+                "config": public_config,
+                "private_configured": private_configured,
+                "env_locked": list(env_locked_keys),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     except Exception as e:
-        log.error(f"获取配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        log.error(f"获取配置失败: {type(e).__name__}")
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @router.post("/save")
@@ -259,12 +286,12 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
                 raise HTTPException(status_code=400, detail="端口号必须是1-65535之间的整数")
 
         if "api_password" in new_config:
-            if not isinstance(new_config["api_password"], str):
-                raise HTTPException(status_code=400, detail="API访问密码必须是字符串")
+            if not isinstance(new_config["api_password"], str) or not new_config["api_password"]:
+                raise HTTPException(status_code=400, detail="API访问密码不能为空")
 
         if "panel_password" in new_config:
-            if not isinstance(new_config["panel_password"], str):
-                raise HTTPException(status_code=400, detail="控制面板密码必须是字符串")
+            if not isinstance(new_config["panel_password"], str) or not new_config["panel_password"]:
+                raise HTTPException(status_code=400, detail="控制面板密码不能为空")
 
         # 获取环境变量锁定的配置键
         env_locked_keys = get_env_locked_keys()
@@ -274,28 +301,24 @@ async def save_config(request: ConfigSaveRequest, token: str = Depends(verify_pa
         for key, value in new_config.items():
             if key not in env_locked_keys:
                 await database.set_config(key, value)
-                if key in ("api_password", "panel_password"):
-                    log.debug(f"设置{key}字段为: {value}")
 
         # 重新加载配置缓存（关键！）
         await config.reload_config()
 
-        # 验证保存后的结果
-        test_api_password = await config.get_api_password()
-        test_panel_password = await config.get_panel_password()
-        log.debug(f"保存后立即读取的API密码: {test_api_password}")
-        log.debug(f"保存后立即读取的面板密码: {test_panel_password}")
-
         # 构建响应消息
         response_data = {
             "message": "配置保存成功",
-            "saved_config": {k: v for k, v in new_config.items() if k not in env_locked_keys},
+            "saved_config": {
+                k: v for k, v in new_config.items()
+                if k not in env_locked_keys and not _is_private_config_key(k)
+            },
         }
 
         return JSONResponse(content=response_data)
 
     except HTTPException:
         raise
-    except Exception as e:
-        log.error(f"保存配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # Database exceptions may contain SQL bind parameters, including passwords.
+        log.error("保存配置失败")
+        raise HTTPException(status_code=500, detail="保存配置失败")

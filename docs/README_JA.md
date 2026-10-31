@@ -4,112 +4,27 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](../LICENSE)
-[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/agy2api/pkgs/container/agy2api)
+[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](../Dockerfile)
 
 [中文](../README.md) | [English](README_EN.md) | 日本語
 
-## インストールガイド
+## インストールとデプロイ
 
-### Termux環境
+このブランチには上流の修正、Responses API とプライバシー対策が含まれます。確認済みのリリースブランチを使用してください。上流のインストールスクリプトと `ghcr.io/su-kaka/agy2api:latest` には本ブランチの変更は含まれません。
 
-**初期インストール**
+[VPS とデータ移行](../DEPLOY.md)、[API 互換性](../RESPONSES_API.md)、[秘密情報と公開前検査](../PRIVACY.md)、[検証結果](../PROJECT_REVIEW.md)を参照してください。
+
+Python 3.13、非公開 `.env`、異なる二つのランダムなパスワード、単一 worker を使用します。Compose はこの checkout からビルドし named volume を使用します。既存の認証データは停止・バックアップ後に移行してください。空の volume で置き換えてはいけません。
+
 ```bash
-curl -o termux-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
+uv sync --locked --no-dev
+uv run --no-sync python web.py
+# 非公開設定と既存データ移行の完了後:
+docker compose build
+docker compose up -d --no-build
 ```
 
-**サービス再起動**
-```bash
-cd agy2api
-bash termux-start.sh
-```
-
-### Windows環境
-
-**初期インストール**
-```powershell
-iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
-```
-
-**サービス再起動**
-`start.bat` をダブルクリックして実行
-
-### Linux環境
-
-**初期インストール**
-```bash
-curl -o install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
-```
-
-**サービス再起動**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### macOS環境
-
-**初期インストール**
-```bash
-curl -o darwin-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
-```
-
-**サービス再起動**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### Docker環境
-
-**Docker Runコマンド**
-```bash
-docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PASSWORD=panel_pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds -v $(pwd)/data/request_logs:/app/data/request_logs ghcr.io/su-kaka/agy2api:latest
-```
-
-**Docker Mac**
-```bash
-docker run -d \
---name agy2api \
--p 7861:7861 \
--p 8080:8080 \
--e API_PASSWORD=api_pwd \
--e PANEL_PASSWORD=panel_pwd \
--e PORT=7861 \
--v $(pwd)/data/creds:/app/creds \
--v $(pwd)/data/request_logs:/app/data/request_logs \
-ghcr.io/su-kaka/agy2api:latest
-```
-
-**Docker Compose Runコマンド**
-1. 以下の内容を `docker-compose.yml` ファイルとして保存:
-    ```yaml
-    version: '3.8'
-
-    services:
-      agy2api:
-        image: ghcr.io/su-kaka/agy2api:latest
-        container_name: agy2api
-        restart: unless-stopped
-        network_mode: host
-        environment:
-          # パスワード設定（個別パスワード）
-          - API_PASSWORD=your_api_password
-          - PANEL_PASSWORD=your_panel_password
-          - PORT=7861
-        volumes:
-          - ./data/creds:/app/creds
-          - ./data/request_logs:/app/data/request_logs
-        healthcheck:
-          test: ["CMD-SHELL", "python -c \"import sys, urllib.request, os; port = os.environ.get('PORT', '7861'); req = urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer ' + os.environ.get('API_PASSWORD', 'pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode() == 200 else 1)\""]
-          interval: 30s
-          timeout: 10s
-          retries: 3
-          start_period: 40s
-    ```
-2. サービスを起動:
-    ```bash
-    docker-compose up -d
-    ```
+環境設定の変更後は再起動してください。認証情報、DB、ログ、バックアップ、状態暗号鍵を公開しないでください。鍵もデータと一緒にバックアップします。Windows／Termux／macOS の補助スクリプトは実機検証済みの保証ではありません。検証範囲は PROJECT_REVIEW.md を参照してください。
 
 ## コア機能
 
@@ -261,13 +176,13 @@ ghcr.io/su-kaka/agy2api:latest
 ## 設定手順
 
 1. `http://127.0.0.1:7861` にアクセス（デフォルトポート、PORT環境変数で変更可能）
-2. OAuth認証フローを完了（デフォルトパスワード: `pwd`、環境変数で変更可能）
+2. 起動前に、Git 管理外の `.env` で `API_PASSWORD` と `PANEL_PASSWORD` を別々に設定し、OAuth 認証を完了してください。未設定なら起動を拒否します。
    - **GCLIモード**: Google Cloud Gemini APIクレデンシャルの取得用
 3. クライアントを設定:
 
 **OpenAI互換クライアント:**
    - **エンドポイントアドレス**: `http://127.0.0.1:7861/v1`
-   - **APIキー**: `pwd`（デフォルト値、API_PASSWORD環境変数で変更可能）
+   - **APIキー**: 設定した `API_PASSWORD`。
 
 **Geminiネイティブクライアント:**
    - **エンドポイントアドレス**: `http://127.0.0.1:7861`
@@ -300,11 +215,11 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 
 **基本設定**
 - `PORT`: サービスポート（デフォルト: 7861）
-- `HOST`: サーバーリッスンアドレス（デフォルト: 0.0.0.0）
+- `HOST`: サーバーリッスンアドレス（デフォルト: 127.0.0.1。外部公開は明示的に設定）
 
 **パスワード設定**
-- `API_PASSWORD`: チャットAPIアクセスパスワード（デフォルト: pwd）
-- `PANEL_PASSWORD`: コントロールパネルアクセスパスワード（デフォルト: pwd）
+- `API_PASSWORD`: チャットAPIアクセスパスワード（必須、デフォルトなし）
+- `PANEL_PASSWORD`: コントロールパネルアクセスパスワード（必須、デフォルトなし）
 
 **アクセス制御設定**
 - `IP_WHITELIST_ENABLED`: IPホワイトリストの有効化（デフォルト: false、制限なし）
@@ -345,7 +260,7 @@ agy2apiは2つのストレージバックエンドに対応: **ローカルSQLit
 - `USAGE_LOG_ENABLED`: リクエストログの有効化（デフォルト: true）。すべてのAPIリクエスト（モデル、クレデンシャル、トークン使用量、レイテンシ、ステータス）をデータベースに記録。自動削除なし、パネルから手動クリア可能
 
 **リクエストボディデバッグログ**
-- `REQUEST_LOG_ENABLED`: リクエストボディ詳細ログの有効化（デフォルト: false）。有効化すると、最終ステータスコードが指定コードに一致した場合、上流へ送信した完全なリクエストヘッダー（マスク済み）とボディを JSON ファイルとして `data/request_logs/` に保存。データベースにはファイル索引のみ記録し、リクエストログ詳細から閲覧可能。主にリクエストボディエラー（例: 400）のデバッグ用。ログのクリア/全削除時にこれらのファイルも削除（Docker では `./data/request_logs:/app/data/request_logs` をマウントして永続化）
+- `REQUEST_LOG_ENABLED`: リクエストボディ詳細ログの有効化（デフォルト: false）。有効化すると、最終ステータスコードが指定コードに一致した場合、上流へ送信した完全なリクエストヘッダー（マスク済み）とボディを JSON ファイルとして `data/request_logs/` に保存。データベースにはファイル索引のみ記録し、リクエストログ詳細から閲覧可能。主にリクエストボディエラー（例: 400）のデバッグ用。ログのクリア/全削除時にこれらのファイルも削除（Docker では `request_logs:/app/data/request_logs` をマウントして永続化）
 - `REQUEST_LOG_ERROR_CODES`: デバッグログを記録するステータスコードリスト、カンマ区切り（デフォルト: 400）
 
 **クレデンシャル選択モード**
@@ -503,12 +418,13 @@ curl -X POST "http://127.0.0.1:7861/v1/messages" \
 from io import BytesIO
 from PIL import Image
 from google.genai import Client
+import os
 from google.genai.types import HttpOptions
 from google.genai import types
 # クライアントは環境変数 `GEMINI_API_KEY` からAPIキーを取得します。
 
 client = Client(
-            api_key="pwd",
+            api_key=os.environ["API_PASSWORD"],
             http_options=HttpOptions(base_url="http://127.0.0.1:7861"),
         )
 

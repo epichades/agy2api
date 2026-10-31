@@ -3,13 +3,13 @@
 同一会话（由请求内容派生的稳定 key）绑定同一凭证，命中上游 prompt cache。
 
 双后端:
-- Redis（可选）: 设置 REDIS_URL 后启用，多实例共享绑定
+- Redis（可选）: 设置 REDIS_URL 后启动时必须连接成功，共享绑定
 - 内存（默认）: 无 Redis 时自动使用，进程内字典 + 过期清理
 
 行为:
 - get: 命中时自动续期 TTL（活跃会话保持绑定，空闲会话过期）
 - set: 每次成功调用后写入/刷新绑定
-- Redis 故障仅跳过该次操作并告警，不影响主流程；内存后端始终可用兜底
+- 运行中 Redis 故障告警并使用本地后备；readiness 返回不可用，不宣称共享亲和仍有效
 """
 
 import asyncio
@@ -46,28 +46,34 @@ def _get_client():
 
 
 async def init_redis(redis_url: str) -> bool:
-    """初始化 Redis 连接。连接失败返回 False（回落内存后端），不抛异常。"""
+    """An explicitly configured Redis must connect; never pretend it is active."""
     global _redis_client
     if not redis_url:
         return False
+    client = None
     try:
         import redis.asyncio as redis_aiolib
-
         client = redis_aiolib.from_url(
-            redis_url,
-            decode_responses=False,
-            socket_connect_timeout=2.0,
-            socket_timeout=2.0,
-            health_check_interval=30,
+            redis_url, decode_responses=False, socket_connect_timeout=2.0,
+            socket_timeout=2.0, health_check_interval=30,
         )
         await client.ping()
-        _redis_client = client
-        log.info("会话凭证缓存已连接 Redis")
-        return True
-    except Exception as e:
-        log.warning(f"Redis 连接失败，使用内存后端: {e}")
+    except Exception:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         _redis_client = None
-        return False
+        raise RuntimeError("Configured Redis is unavailable") from None
+    _redis_client = client
+    log.info("Session cache connected to Redis")
+    return True
+
+
+async def check_health() -> None:
+    if _redis_client is not None:
+        await _redis_client.ping()
 
 
 async def close() -> None:
@@ -151,7 +157,7 @@ async def get_session_binding(session_key: str) -> Optional[str]:
             await client.expire(redis_key, SESSION_BINDING_TTL)
             return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
         except Exception as e:
-            log.warning(f"Redis get 会话绑定失败: {e}")
+            log.warning(f"Redis get 会话绑定失败: {type(e).__name__}")
             # Redis 故障回落内存后端
 
     return await _memory_get(session_key)
@@ -169,7 +175,7 @@ async def set_session_binding(session_key: str, email: str) -> None:
                 f"{_KEY_PREFIX}{session_key}", SESSION_BINDING_TTL, email
             )
         except Exception as e:
-            log.warning(f"Redis set 会话绑定失败: {e}")
+            log.warning(f"Redis set 会话绑定失败: {type(e).__name__}")
 
     await _memory_set(session_key, email)
 
@@ -184,7 +190,7 @@ async def delete_session_binding(session_key: str) -> None:
         try:
             await client.delete(f"{_KEY_PREFIX}{session_key}")
         except Exception as e:
-            log.warning(f"Redis delete 会话绑定失败: {e}")
+            log.warning(f"Redis delete 会话绑定失败: {type(e).__name__}")
 
     async with _memory_lock:
         _memory_store.pop(session_key, None)

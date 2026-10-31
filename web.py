@@ -6,12 +6,15 @@ Main Web Integration - Integrates all routers and modules
 import os
 from contextlib import asynccontextmanager
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
-from fastapi.staticfiles import StaticFiles
 
-from log import log
+from log import log, attach_stdlib_loggers
 
 # Import managers and utilities
 # credential_manager 已重构为无状态函数模块（无需初始化/关闭）
@@ -24,63 +27,47 @@ from src.router.antigravity.model_list import router as antigravity_model_list_r
 from src.panel import router as panel_router
 
 
+def validate_worker_count() -> None:
+    """OAuth callbacks are process-local: reject unsupported worker topology."""
+    try:
+        workers = int(os.environ.get("WORKERS", "1"))
+    except ValueError:
+        raise RuntimeError("WORKERS must be 1") from None
+    if workers != 1:
+        raise RuntimeError("WORKERS must be 1; multi-worker OAuth is not supported")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    log.info("启动 AGY2API 主服务")
+    """Do not serve requests before all configured stores are usable."""
+    from src import session_cache
+    from src.storage.database import close_database, get_database
+    import config
 
-    # 初始化配置缓存（优先执行）
+    validate_worker_count()
+    attach_stdlib_loggers()
+    app.state.ready = False
     try:
-        import config
-        await config.init_config()
-        log.info("配置缓存初始化成功")
-    except Exception as e:
-        log.error(f"配置缓存初始化失败: {e}")
-
-    # 预热数据库连接（提前暴露配置问题）
-    try:
-        from src.storage.database import get_database
-        await get_database()
-        log.info("数据库连接就绪")
-    except Exception as e:
-        log.error(f"数据库初始化失败: {e}")
-
-    # 初始化会话凭证缓存（Redis 可选，未配置时使用内存后端）
-    try:
-        import os as os_module
-        from src import session_cache
-
-        redis_url = os_module.getenv("REDIS_URL", "")
+        if not await config.init_config():
+            raise RuntimeError("Configuration initialization failed")
+        if not await config.get_api_password() or not await config.get_panel_password():
+            raise RuntimeError("Set API_PASSWORD and PANEL_PASSWORD before starting")
+        database = await get_database()
+        await database.check_health()
+        from src.responses.encrypted import initialize_key
+        initialize_key()
+        redis_url = os.environ.get("REDIS_URL", "").strip()
         if redis_url:
             await session_cache.init_redis(redis_url)
-        else:
-            log.info("未配置 REDIS_URL，会话凭证缓存使用内存后端")
-    except Exception as e:
-        log.warning(f"会话凭证缓存初始化失败（使用内存后端）: {e}")
-
-    # OAuth回调服务器将在需要时按需启动
-
-    yield
-
-    # 清理资源
-    log.info("开始关闭 AGY2API 主服务")
-
-    # 关闭凭证管理器与数据库
-    try:
-        from src.storage.database import close_database
-        await close_database()
-        log.info("数据库已关闭")
-    except Exception as e:
-        log.error(f"关闭数据库时出错: {e}")
-
-    # 关闭会话凭证缓存
-    try:
-        from src import session_cache
+        app.state.ready = True
+        log.info("AGY2API stores ready")
+        yield
+    finally:
+        app.state.ready = False
         await session_cache.close()
-    except Exception as e:
-        log.debug(f"关闭会话缓存时出错: {e}")
+        await close_database()
 
-    log.info("AGY2API 主服务已停止")
+
 
 
 class IPWhitelistMiddleware:
@@ -104,9 +91,9 @@ class IPWhitelistMiddleware:
         try:
             enabled, rules = await config.get_ip_whitelist_rules()
         except Exception as e:
-            # 配置读取失败时放行，避免锁定全部流量
-            log.error(f"读取 IP 白名单配置失败，已放行本次请求: {e}")
-            await self.app(scope, receive, send)
+            log.error(f"IP policy unavailable: {type(e).__name__}")
+            response = JSONResponse(status_code=503, content={"error": "Service configuration unavailable"})
+            await response(scope, receive, send)
             return
 
         if enabled:
@@ -182,9 +169,32 @@ if path_prefix:
     app.add_middleware(PathPrefixMiddleware, prefix=path_prefix)
     log.info(f"已启用路径前缀剥离: {path_prefix}")
 
+# [local patch] 兼容旧路径 /antigravity/v1/... -> /v1/...（最外层，先于白名单与路由）
+from src.compat_prefix import AntigravityCompatPrefixMiddleware
+app.add_middleware(AntigravityCompatPrefixMiddleware)
+
+@app.get("/health/ready", include_in_schema=False)
+async def readiness():
+    """No secrets or account details; check a live database round trip."""
+    if not getattr(app.state, "ready", False):
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    try:
+        from src.storage.database import get_database
+        await (await get_database()).check_health()
+        from src import session_cache
+        await session_cache.check_health()
+    except Exception:
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    return JSONResponse(content={"status": "ready"}, headers={"Cache-Control": "no-store"})
+
+
 # 挂载路由器
 # Antigravity路由 - 处理OpenAI格式请求并转换为Antigravity API
 app.include_router(antigravity_openai_router, prefix="", tags=["Antigravity OpenAI API"])
+
+# [local patch responses] OpenAI Responses API (/v1/responses)
+from src.router.antigravity.responses import router as antigravity_responses_router
+app.include_router(antigravity_responses_router, prefix="", tags=["Antigravity OpenAI Responses API"])
 
 # Antigravity路由 - 处理Gemini格式请求并转换为Antigravity API
 app.include_router(antigravity_gemini_router, prefix="", tags=["Antigravity Gemini API"])
@@ -198,18 +208,14 @@ app.include_router(antigravity_anthropic_router, prefix="", tags=["Antigravity A
 # Panel路由 - 包含认证、凭证管理和控制面板功能
 app.include_router(panel_router, prefix="", tags=["Panel Interface"])
 
-# 静态文件路由 - 服务docs目录下的文件（目录不存在时跳过）
-if os.path.isdir("docs"):
-    app.mount("/docs", StaticFiles(directory="docs"), name="docs")
-
-
 def main():
     """主启动函数：uvicorn 直接运行 ASGI 应用"""
     import uvicorn
 
     port = int(os.environ.get("PORT", 7861))
-    host = os.environ.get("HOST", "0.0.0.0")
-    workers = int(os.environ.get("WORKERS", 1))
+    host = os.environ.get("HOST", "127.0.0.1")
+    validate_worker_count()
+    workers = 1
 
     log.info("=" * 60)
     log.info("启动 AGY2API")
@@ -225,6 +231,8 @@ def main():
         port=port,
         workers=workers if workers > 1 else None,
         log_level="info",
+        # Gemini accepts ?key= authentication; access logs would expose that key.
+        access_log=False,
     )
 
 

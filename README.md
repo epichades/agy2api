@@ -4,94 +4,32 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/agy2api/pkgs/container/agy2api)
+[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](Dockerfile)
 
 [English](docs/README_EN.md) | 中文 | [日本語](docs/README_JA.md)
 
 > **⚠️ 重要变更**：GeminiCLI 端点已被谷歌抛弃，本项目已完全移除 GeminiCLI 相关代码，仅保留 Antigravity 模式。
 
-## 安装指南
+## 安装与部署
 
-### Termux 环境
+此分支已整合上游修正、Responses API 和隐私保护。请从审阅后的发布分支部署；上游安装脚本及 `ghcr.io/su-kaka/agy2api:latest` 不包含本分支功能。
 
-**初始安装**
+- [VPS 部署、Docker 数据迁移和私密设置](DEPLOY.md)
+- [Responses、Codex 与 Claude Code 支持范围](RESPONSES_API.md)
+- [隐私、状态密钥和发布检查](PRIVACY.md)
+- [修正与验证结果](PROJECT_REVIEW.md)
+
+使用 Python 3.13、私有 `.env` 和两组不同的随机密码。默认只支持单 worker。Docker 使用当前 checkout 本机 build；已有 `data/creds` 的部署应先按部署说明停机备份并搬移到 named volume，不能直接以空数据启动。
+
 ```bash
-curl -o termux-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
+uv sync --locked --no-dev
+uv run --no-sync python web.py
+# Docker 完成私有配置与既有数据迁移后：
+docker compose build
+docker compose up -d --no-build
 ```
 
-**重启服务**
-```bash
-cd agy2api
-bash termux-start.sh
-```
-
-### Windows 环境
-
-**初始安装**
-```powershell
-iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
-```
-
-**重启服务**
-双击执行 `start.bat`
-
-### Linux 环境
-
-**初始安装**
-```bash
-curl -o install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
-```
-
-**重启服务**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### macOS 环境
-
-**初始安装**
-```bash
-curl -o darwin-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
-```
-
-**重启服务**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### Docker 环境
-
-**Docker 运行命令**
-```bash
-docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PASSWORD=panel_pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds -v $(pwd)/data/request_logs:/app/data/request_logs ghcr.io/su-kaka/agy2api:latest
-```
-
-**Docker Compose 运行命令**
-1. 使用仓库中的 `docker-compose.yml`，或参考以下内容：
-    ```yaml
-    version: '3.8'
-
-    services:
-      agy2api:
-        image: ghcr.io/su-kaka/agy2api:latest
-        container_name: agy2api
-        restart: unless-stopped
-        network_mode: host
-        environment:
-          # 密码配置（分离密码）
-          - API_PASSWORD=your_api_password
-          - PANEL_PASSWORD=your_panel_password
-          - PORT=7861
-        volumes:
-          - ./data/creds:/app/creds
-          - ./data/request_logs:/app/data/request_logs
-    ```
-2. 启动服务：
-    ```bash
-    docker-compose up -d
-    ```
+修改 `.env` 后重启。金钥、Google 凭证、数据库及备份不得提交；新加密状态金钥需与私有数据一并备份。Windows／Termux／macOS 包含启动辅助脚本，平台运行仍需自行验证；本次测试及尚未实测的边界以评估文件为准。
 
 ## 核心功能
 
@@ -104,6 +42,10 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - 支持所有 Antigravity 模型（Claude、Gemini 等）
 - 自动模型名称映射和思维模式检测
 - 多种认证方式：Bearer 头部、x-api-key、x-goog-api-key、URL 参数 key
+
+Chat Completions 接受常见 SDK 附加参数与合法 `null`；只有已实现的字段会送往上游。未套用项目通过 `x-agy-ignored-params` 响应头及 `x_agy_ignored_params` 扩展字段报告，只包含名称、不包含参数值。`metadata` 不保存，`reasoning_effort` 不改变精确模型，`parallel_tool_calls=false` 目前不会强制串行。legacy functions、音频输出等不支持的能力仍明确拒绝。
+
+请求 `stream_options.include_usage=true` 时，一般事件的 `usage=null`，结束前另发 `choices=[]` 的用量事件；未请求时不输出流式 usage。Chat 抗截断续传会按每轮最终计数汇总，任一轮缺少用量则报告 `upstream_usage_incomplete`，不会将部分计数当作完整总量。核心消息／字段类型及回放签章验证仍然保留。
 
 ### 📊 智能凭证管理系统
 
@@ -141,18 +83,21 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 **特殊功能变体：**
 - **抗截断模式**：在模型名称前添加 `抗截断-` 前缀
   - 例：`抗截断-gemini-2.5-pro`
-  - 通过合成工具调用绕过截断限制，确保完整回答（流式和非流式均有效）
+  - 流式请求使用合成 `emit_answer` 工具与有界续传尝试；不保证每次回答都完整，非流式不会启用续传。
+  - Claude 使用 `AUTO` 选择工具并由提示词引导，保留原模型和 thinking，不强制调用 `emit_answer`。模型也可以直接返回文字；Gemini 的纯函数工具模式仍使用 `ANY`。
+  - Claude 抗截断模式若覆盖明确的 `tool_choice` 限制，会回报 `tool_choice(anti_truncation_auto)`。普通模式不改写用户的强制工具选择；不支持该能力的上游会明确拒绝。[Claude 工具选择限制](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)
+  - 此模式会改写输出表示，原有处理器也会替换真实 thoughtSignature，因此不是无损 history 通道。需要原始思考签章与工具回放保真的 Codex／Claude 对话，请使用不带此前缀的模型；保留 thinking 设置不等于签章原样保留。
 - **图像生成模型**支持分辨率（`-2k`、`-4k`）和比例（`-16x9`、`-9x16` 等）后缀
 
 ## 配置说明
 
 1. 访问 `http://127.0.0.1:7861`（默认端口，可通过 PORT 环境变量修改）
-2. 完成 Antigravity OAuth 认证流程（默认密码：`pwd`，可通过环境变量修改）
+2. 在未提交的 `.env` 中分别设置 `API_PASSWORD` 与 `PANEL_PASSWORD`，启动服务后完成 Antigravity OAuth 认证。未设置密码时服务会拒绝启动。
 3. 配置客户端：
 
 **OpenAI 兼容客户端：**
 - **端点地址**：`http://127.0.0.1:7861/v1`
-- **API 密钥**：`pwd`（默认值，可通过 API_PASSWORD 环境变量修改）
+- **API 密钥**：使用自己设置的 `API_PASSWORD`。
 
 **Gemini 原生客户端：**
 - **端点地址**：`http://127.0.0.1:7861`
@@ -182,11 +127,11 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 
 **基础配置**
 - `PORT`: 服务端口（默认：7861）
-- `HOST`: 服务器监听地址（默认：0.0.0.0）
+- `HOST`: 服务器监听地址（默认：127.0.0.1；远端访问需明确配置）
 
 **密码配置**
-- `API_PASSWORD`: 聊天 API 访问密码（默认：pwd）
-- `PANEL_PASSWORD`: 控制面板访问密码（默认：pwd）
+- `API_PASSWORD`: 聊天 API 访问密码（必填，无默认值）
+- `PANEL_PASSWORD`: 控制面板访问密码（必填，无默认值）
 
 **访问控制配置**
 - `IP_WHITELIST_ENABLED`: 启用 IP 白名单（默认：false，不限制）
@@ -228,7 +173,7 @@ docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PAS
 - `USAGE_LOG_ENABLED`: 启用请求日志（默认：true）。记录每次 API 请求（模型、凭证、token 用量、耗时、状态）到数据库，不自动清理，可在面板手动清理或清空
 
 **请求体详细日志配置**
-- `REQUEST_LOG_ENABLED`: 启用请求体详细日志（默认：false）。开启后，当请求命中指定错误码时，把发往上游的完整请求头（已脱敏）与请求体保存为 JSON 文件到 `data/request_logs/`，数据库仅记录文件索引，在"请求日志"详情中查看。主要用于请求体错误时排查 debug；清理/清空日志时会同步删除对应文件（Docker 部署请挂载 `./data/request_logs:/app/data/request_logs` 以持久化）
+- `REQUEST_LOG_ENABLED`: 启用请求体详细日志（默认：false）。开启后，当请求命中指定错误码时，把发往上游的完整请求头（已脱敏）与请求体保存为 JSON 文件到 `data/request_logs/`，数据库仅记录文件索引，在"请求日志"详情中查看。主要用于请求体错误时排查 debug；清理/清空日志时会同步删除对应文件（Docker 部署请挂载 `request_logs:/app/data/request_logs` 以持久化）
 - `REQUEST_LOG_ERROR_CODES`: 触发详细日志的错误码列表，逗号分隔（默认：400）
 
 **凭证选择模式**
@@ -293,11 +238,12 @@ curl -X POST "http://127.0.0.1:7861/v1/messages" \
 from io import BytesIO
 from PIL import Image
 from google.genai import Client
+import os
 from google.genai.types import HttpOptions
 from google.genai import types
 
 client = Client(
-    api_key="pwd",
+    api_key=os.environ["API_PASSWORD"],
     http_options=HttpOptions(base_url="http://127.0.0.1:7861"),
 )
 

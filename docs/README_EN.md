@@ -4,114 +4,29 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License: CNC-1.0](https://img.shields.io/badge/License-CNC--1.0-red.svg)](../LICENSE)
-[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](https://github.com/su-kaka/agy2api/pkgs/container/agy2api)
+[![Docker](https://img.shields.io/badge/docker-available-blue.svg)](../Dockerfile)
 
 [中文](../README.md) | English | [日本語](./README_JA.md)
 
 > **⚠️ Important Change**: The GeminiCLI endpoint has been deprecated by Google. All GeminiCLI-related code has been completely removed; only the Antigravity mode remains.
 
-## Installation Guide
+## Installation and deployment
 
-### Termux Environment
+This branch includes upstream fixes, the Responses adapter, and privacy safeguards. Deploy the reviewed release branch. Upstream download scripts and `ghcr.io/su-kaka/agy2api:latest` do not include these changes.
 
-**Initial Installation**
+See [VPS deployment and data migration](../DEPLOY.md), [API compatibility](../RESPONSES_API.md), [private settings and publication checks](../PRIVACY.md), and [verification results](../PROJECT_REVIEW.md).
+
+Use Python 3.13, a private `.env`, two independent random passwords, and one worker. The supplied Compose builds this checkout and uses named volumes. Stop and back up an existing deployment, then migrate its credential data before starting the new service; follow DEPLOY.md rather than initializing an empty volume.
+
 ```bash
-curl -o termux-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/termux-install.sh" && chmod +x termux-install.sh && ./termux-install.sh
+uv sync --locked --no-dev
+uv run --no-sync python web.py
+# After private configuration and any existing-data migration:
+docker compose build
+docker compose up -d --no-build
 ```
 
-**Restart Service**
-```bash
-cd agy2api
-bash termux-start.sh
-```
-
-### Windows Environment
-
-**Initial Installation**
-```powershell
-iex (iwr "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.ps1" -UseBasicParsing).Content
-```
-
-**Restart Service**
-Double-click to execute `start.bat`
-
-### Linux Environment
-
-**Initial Installation**
-```bash
-curl -o install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/install.sh" && chmod +x install.sh && ./install.sh
-```
-
-**Restart Service**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### macOS Environment
-
-**Initial Installation**
-```bash
-curl -o darwin-install.sh "https://raw.githubusercontent.com/su-kaka/agy2api/refs/heads/master/darwin-install.sh" && chmod +x darwin-install.sh && ./darwin-install.sh
-```
-
-**Restart Service**
-```bash
-cd agy2api
-bash start.sh
-```
-
-### Docker Environment
-
-**Docker Run Command**
-```bash
-docker run -d --name agy2api --network host -e API_PASSWORD=api_pwd -e PANEL_PASSWORD=panel_pwd -e PORT=7861 -v $(pwd)/data/creds:/app/creds -v $(pwd)/data/request_logs:/app/data/request_logs ghcr.io/su-kaka/agy2api:latest
-```
-
-**Docker Mac**
-```bash
-docker run -d \
-  --name agy2api \
-  -p 7861:7861 \
-  -p 8080:8080 \
-  -e API_PASSWORD=api_pwd \
-  -e PANEL_PASSWORD=panel_pwd \
-  -e PORT=7861 \
-  -v "$(pwd)/data/creds":/app/creds \
-  -v "$(pwd)/data/request_logs":/app/data/request_logs \
-  ghcr.io/su-kaka/agy2api:latest
-```
-
-**Docker Compose Run Command**
-1. Save the following content as `docker-compose.yml` file:
-    ```yaml
-    version: '3.8'
-
-    services:
-      agy2api:
-        image: ghcr.io/su-kaka/agy2api:latest
-        container_name: agy2api
-        restart: unless-stopped
-        network_mode: host
-        environment:
-          # Password configuration (separate passwords)
-          - API_PASSWORD=your_api_password
-          - PANEL_PASSWORD=your_panel_password
-          - PORT=7861
-        volumes:
-          - ./data/creds:/app/creds
-          - ./data/request_logs:/app/data/request_logs
-        healthcheck:
-          test: ["CMD-SHELL", "python -c \"import sys, urllib.request, os; port = os.environ.get('PORT', '7861'); req = urllib.request.Request(f'http://localhost:{port}/v1/models', headers={'Authorization': 'Bearer ' + os.environ.get('API_PASSWORD', 'pwd')}); sys.exit(0 if urllib.request.urlopen(req, timeout=5).getcode() == 200 else 1)\""]
-          interval: 30s
-          timeout: 10s
-          retries: 3
-          start_period: 40s
-    ```
-2. Start the service:
-    ```bash
-    docker-compose up -d
-    ```
+Restart after environment changes. Keep credentials, databases, logs, backups and replay-state keys private; back up the state key with the data. Platform-specific launch helpers do not constitute Windows, Termux or macOS deployment certification. Actual test evidence and remaining live validation are recorded in PROJECT_REVIEW.md.
 
 ## Core Features
 
@@ -266,12 +181,12 @@ All models have 1M context window capacity. Each credential file provides 1000 r
 ## Configuration Instructions
 
 1. Visit `http://127.0.0.1:7861` (default port, modifiable via PORT environment variable)
-2. Complete OAuth authentication flow (default password: `pwd`, modifiable via environment variables)
+2. Set distinct `API_PASSWORD` and `PANEL_PASSWORD` values in an untracked `.env` file before starting, then complete OAuth authentication. Startup refuses unset passwords.
 3. Configure client:
 
 **OpenAI Compatible Client:**
    - **Endpoint Address**: `http://127.0.0.1:7861/v1`
-   - **API Key**: `pwd` (default value, modifiable via API_PASSWORD environment variable)
+   - **API Key**: your configured `API_PASSWORD`.
 
 **Gemini Native Client:**
    - **Endpoint Address**: `http://127.0.0.1:7861`
@@ -304,11 +219,11 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "email"
 
 **Basic Configuration**
 - `PORT`: Service port (default: 7861)
-- `HOST`: Server listen address (default: 0.0.0.0)
+- `HOST`: Server listen address (default: 127.0.0.1; configure explicitly for remote access)
 
 **Password Configuration**
-- `API_PASSWORD`: Chat API access password (default: pwd)
-- `PANEL_PASSWORD`: Control panel access password (default: pwd)
+- `API_PASSWORD`: Chat API access password (required, no default)
+- `PANEL_PASSWORD`: Control panel access password (required, no default)
 
 **Access Control Configuration**
 - `IP_WHITELIST_ENABLED`: Enable IP whitelist (default: false, no restriction)
@@ -349,7 +264,7 @@ Import/export uses a standardized JSON format: `{"refresh_token": "...", "email"
 - `USAGE_LOG_ENABLED`: Enable request logging (default: true). Records every API request (model, credential, token usage, latency, status) to the database. No automatic cleanup; use the panel to clear logs manually
 
 **Request Body Debug Log**
-- `REQUEST_LOG_ENABLED`: Enable request body debug logging (default: false). When enabled and the final status code matches the configured codes, the full request headers (redacted) and body sent upstream are saved as JSON files under `data/request_logs/`. Only the file index is stored in the database; view it from the request log detail modal. Mainly for debugging request body errors (e.g. 400); clearing/truncating logs also deletes these files (mount `./data/request_logs:/app/data/request_logs` in Docker to persist)
+- `REQUEST_LOG_ENABLED`: Enable request body debug logging (default: false). When enabled and the final status code matches the configured codes, the full request headers (redacted) and body sent upstream are saved as JSON files under `data/request_logs/`. Only the file index is stored in the database; view it from the request log detail modal. Mainly for debugging request body errors (e.g. 400); clearing/truncating logs also deletes these files (mount `request_logs:/app/data/request_logs` in Docker to persist)
 - `REQUEST_LOG_ERROR_CODES`: Status codes that trigger debug logging, comma separated (default: 400)
 
 **Credential Select Mode**
@@ -506,12 +421,13 @@ curl -X POST "http://127.0.0.1:7861/v1/messages" \
 from io import BytesIO
 from PIL import Image
 from google.genai import Client
+import os
 from google.genai.types import HttpOptions
 from google.genai import types
 # The client gets the API key from the environment variable `GEMINI_API_KEY`.
 
 client = Client(
-            api_key="pwd",
+            api_key=os.environ["API_PASSWORD"],
             http_options=HttpOptions(base_url="http://127.0.0.1:7861"),
         )
 

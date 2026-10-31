@@ -1,7 +1,7 @@
 """
 数据库层（SQLAlchemy 2.0 异步 ORM）
 统一支持 SQLite（默认）与 PostgreSQL。
-凭证以 email 为唯一键；schema 变更不做旧数据兼容（新表直接重建）。
+凭证以 email 为唯一键；旧凭证结构保留原始表并迁移；配置读取直接查询存储以避免跨进程旧值。
 """
 
 import asyncio
@@ -193,59 +193,68 @@ class Database:
             if self._initialized:
                 return
 
-            postgres_uri = os.getenv("POSTGRESQL_URI", "")
-            credentials_dir = os.getenv("CREDENTIALS_DIR", "./creds")
-            os.makedirs(credentials_dir, exist_ok=True)
+            try:
+                postgres_uri = os.getenv("POSTGRESQL_URI", "")
+                credentials_dir = os.getenv("CREDENTIALS_DIR", "./creds")
+                os.makedirs(credentials_dir, mode=0o700, exist_ok=True)
 
-            if postgres_uri:
-                # PostgreSQL（postgres:// 或 postgresql:// -> postgresql+asyncpg://）
-                dsn = postgres_uri
-                if dsn.startswith("postgresql://"):
-                    dsn = "postgresql+asyncpg://" + dsn[len("postgresql://"):]
-                elif dsn.startswith("postgres://"):
-                    dsn = "postgresql+asyncpg://" + dsn[len("postgres://"):]
-                elif not dsn.startswith("postgresql+"):
-                    dsn = "postgresql+asyncpg://" + dsn
-                self._engine = create_async_engine(dsn, pool_size=5, max_overflow=5, pool_pre_ping=True)
-                self._backend_type = "postgresql"
-            else:
-                # SQLite 默认
-                db_path = os.path.join(credentials_dir, "credentials.db")
-                self._engine = create_async_engine(
-                    f"sqlite+aiosqlite:///{db_path}",
-                    connect_args={"timeout": 30},
+                if postgres_uri:
+                    # PostgreSQL（postgres:// 或 postgresql:// -> postgresql+asyncpg://）
+                    dsn = postgres_uri
+                    if dsn.startswith("postgresql://"):
+                        dsn = "postgresql+asyncpg://" + dsn[len("postgresql://"):]
+                    elif dsn.startswith("postgres://"):
+                        dsn = "postgresql+asyncpg://" + dsn[len("postgres://"):]
+                    elif not dsn.startswith("postgresql+"):
+                        dsn = "postgresql+asyncpg://" + dsn
+                    self._engine = create_async_engine(dsn, pool_size=5, max_overflow=5, pool_pre_ping=True)
+                    self._backend_type = "postgresql"
+                else:
+                    # SQLite 默认
+                    db_path = os.path.join(credentials_dir, "credentials.db")
+                    self._engine = create_async_engine(
+                        f"sqlite+aiosqlite:///{db_path}",
+                        connect_args={"timeout": 30},
+                    )
+                    self._backend_type = "sqlite"
+
+                self._session_factory = async_sessionmaker(
+                    self._engine, expire_on_commit=False, class_=AsyncSession
                 )
-                self._backend_type = "sqlite"
 
-            self._session_factory = async_sessionmaker(
-                self._engine, expire_on_commit=False, class_=AsyncSession
-            )
+                # 建表：保留旧 filename 表，再复制可恢复记录到 email 键结构
+                async with self._engine.begin() as conn:
+                    await conn.run_sync(self._create_tables)
 
-            # 建表（不兼容旧结构：旧的 filename 键结构表会被重建为 email 键结构）
-            async with self._engine.begin() as conn:
-                await conn.run_sync(self._create_tables)
+                # 标记初始化完成（供 session() 使用），再加载配置缓存
+                self._initialized = True
+                if self._backend_type == "sqlite":
+                    os.chmod(db_path, 0o600)
 
-            # 标记初始化完成（供 session() 使用），再加载配置缓存
-            self._initialized = True
+                # 加载配置缓存
+                await self._load_config_cache()
 
-            # 加载配置缓存
-            await self._load_config_cache()
-
-            log.info(f"Database initialized (backend={self._backend_type})")
+                log.info(f"Database initialized (backend={self._backend_type})")
+            except BaseException:
+                await self.close()
+                raise
 
     def _create_tables(self, sync_conn) -> None:
         """建表。
-        - 凭证表：结构性变更（键从 filename 变为 email）时删除重建
+        - 凭证表：结构性变更时保留原表并迁移，未知身份记录停用保存
         - 其余表：缺列时用 ALTER TABLE ADD COLUMN 补齐，保留原有数据
         """
         inspector = inspect(sync_conn)
         table_name = AntigravityCredential.__tablename__
+        legacy_table = None
         if inspector.has_table(table_name):
             existing_columns = {c["name"] for c in inspector.get_columns(table_name)}
-            # 旧结构以 filename 为键、无 email 列 —— 删除重建（数据无法迁移）
+            # [local patch] 旧结构不再 DROP：改名保留并在建表后迁移账号（见 legacy_migration）
             if "filename" in existing_columns or "email" not in existing_columns:
-                log.info("检测到旧版凭证表结构（filename 键），重建为 email 键结构")
-                sync_conn.execute(text(f"DROP TABLE {table_name}"))
+                log.info("检测到旧版凭证表结构（filename 键），改名保留并迁移为 email 键结构")
+                from src.storage.legacy_migration import rename_legacy_table
+                legacy_table = rename_legacy_table(sync_conn)
+                inspector = inspect(sync_conn)
 
         # 已存在的表补齐缺失列（ALTER TABLE ADD COLUMN，保留数据）
         for orm_model in (UsageLog,):
@@ -272,12 +281,18 @@ class Database:
 
         Base.metadata.create_all(sync_conn)
 
+        if legacy_table:
+            from src.storage.legacy_migration import migrate_rows
+            migrate_rows(sync_conn, legacy_table)
+
     async def close(self) -> None:
         if self._engine:
             await self._engine.dispose()
             self._engine = None
         self._session_factory = None
         self._initialized = False
+        self._config_cache.clear()
+        self._config_loaded = False
         log.debug("Database closed")
 
     @property
@@ -315,7 +330,8 @@ class Database:
             client_id = credential_data.get("client_id") or ""
             client_secret = credential_data.get("client_secret") or ""
             project_id = credential_data.get("project_id") or ""
-            expiry = credential_data.get("expiry") or ""
+            expiry_val = credential_data.get("expiry") or ""
+            expiry = expiry_val.isoformat() if hasattr(expiry_val, "isoformat") else str(expiry_val)
             tier = credential_data.get("tier")
 
             if row:
@@ -711,12 +727,21 @@ class Database:
             return True
 
     async def get_config(self, key: str, default: Any = None) -> Any:
-        self._ensure_initialized()
-        return self._config_cache.get(key, default)
+        async with self.session() as session:
+            item = await session.get(ConfigItem, key)
+            return default if item is None else _load_json(item.value, item.value)
 
     async def get_all_config(self) -> Dict[str, Any]:
-        self._ensure_initialized()
-        return self._config_cache.copy()
+        async with self.session() as session:
+            rows = (await session.scalars(select(ConfigItem))).all()
+            values = {item.key: _load_json(item.value, item.value) for item in rows}
+        self._config_cache = values
+        return values.copy()
+
+    async def check_health(self) -> None:
+        """Exercise an actual connection, not only the initialized flag."""
+        async with self.session() as session:
+            await session.execute(text("SELECT 1"))
 
     async def delete_config(self, key: str) -> bool:
         async with self.session() as s:
@@ -942,7 +967,11 @@ async def get_database() -> Database:
         async with _database_lock:
             if _database is None:
                 db = Database()
-                await db.initialize()
+                try:
+                    await db.initialize()
+                except BaseException:
+                    await db.close()
+                    raise
                 _database = db
     return _database
 
@@ -953,3 +982,5 @@ async def close_database() -> None:
     if _database:
         await _database.close()
         _database = None
+    import config
+    config.clear_config_cache()

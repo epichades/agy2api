@@ -1,6 +1,10 @@
+from datetime import datetime, timedelta, timezone
+import hashlib
+import secrets
 from typing import Optional
 
 import httpx
+import jwt
 
 from config import get_api_password, get_panel_password
 from fastapi import Depends, HTTPException, Header, Query, Request, status
@@ -207,11 +211,30 @@ authenticate_gemini_flexible = authenticate_flexible
 
 # ====================== Panel Authentication Functions ======================
 
+def _panel_signing_key(panel_password: str) -> bytes:
+    return hashlib.sha256(b"agy2api-panel-session-v1\0" + panel_password.encode()).digest()
+
+
+def create_panel_token(panel_password: str) -> str:
+    """Issue a short-lived panel session; the browser never stores the password."""
+    if not panel_password:
+        raise ValueError("Panel password is not configured")
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "sub": "panel",
+            "iat": now,
+            "exp": now + timedelta(hours=8),
+            "jti": secrets.token_urlsafe(16),
+        },
+        _panel_signing_key(panel_password),
+        algorithm="HS256",
+    )
+
+
 async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
-    简化的控制面板密码验证函数
-
-    直接验证Bearer token是否等于控制面板密码
+    验证有效期内的控制面板会话令牌。
 
     Args:
         credentials: HTTPAuthorizationCredentials 自动注入
@@ -224,6 +247,17 @@ async def verify_panel_token(credentials: HTTPAuthorizationCredentials = Depends
     """
 
     password = await get_panel_password()
-    if credentials.credentials != password:
+    if not password:
         raise HTTPException(status_code=401, detail="密码错误")
+    try:
+        claims = jwt.decode(
+            credentials.credentials,
+            _panel_signing_key(password),
+            algorithms=["HS256"],
+            options={"require": ["sub", "iat", "exp", "jti"]},
+        )
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="会话无效或已过期")
+    if claims.get("sub") != "panel":
+        raise HTTPException(status_code=401, detail="会话无效或已过期")
     return credentials.credentials

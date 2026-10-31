@@ -4,6 +4,7 @@ Anthropic Router - Handles Anthropic/Claude format API requests via Antigravity
 """
 
 # 标准库
+import copy
 import json
 import sys
 from pathlib import Path
@@ -29,11 +30,12 @@ from src.utils import (
 )
 
 # 本地模块 - 基础路由工具
-from src.router.hi_check import is_health_check_request, create_health_check_response
 from src.router.stream_passthrough import (
     build_streaming_response_or_error,
     prepend_async_item,
     read_first_async_item,
+    close_async_iterator,
+    ManagedStreamingResponse,
 )
 
 # 本地模块 - 数据模型
@@ -50,8 +52,14 @@ from src.converter.anthropic2gemini import (
     anthropic_to_gemini_request,
     gemini_to_anthropic_response,
     gemini_stream_to_anthropic_stream,
+    aggregate_gemini_to_anthropic,
+    AnthropicStreamError,
+    _normalize_function_name,
 )
 from src.converter.antigravity_fix import normalize_antigravity_request
+from src.responses import encrypted as replay_state
+from src.responses.request import _arguments_digest
+from src.converter.thoughtSignature_fix import encode_tool_id_with_signature
 from src.converter.anti_truncation import (
     AntiTruncationStreamProcessor,
     apply_anti_truncation,
@@ -65,205 +73,306 @@ router = APIRouter()
 
 # ==================== API 路由 ====================
 
+def _native_error(status: int, message: str, error_type: str = "api_error", headers=None) -> JSONResponse:
+    return JSONResponse(status_code=status, headers=headers,
+                        content={"type": "error", "error": {"type": error_type, "message": message}})
+
+
+def _upstream_error(response: Response) -> JSONResponse:
+    status = response.status_code
+    message = f"Upstream request failed (HTTP {status})"
+    try:
+        data = json.loads(response.body)
+        error = data.get("error", data)
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            message = error["message"]
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if status in (401, 403):
+        status = 502
+    kind = "rate_limit_error" if status == 429 else "invalid_request_error" if status in (400, 404, 422) else "api_error"
+    result = _native_error(status if status >= 400 else 502, message, kind)
+    if response.headers.get("retry-after"):
+        result.headers["Retry-After"] = response.headers["retry-after"]
+    return result
+
+
+def _validate_capabilities(payload: dict, request: Request):
+    allowed = {"model", "messages", "system", "max_tokens", "temperature", "top_p", "top_k", "stream",
+               "stop_sequences", "tools", "tool_choice", "metadata", "thinking", "size", "service_tier",
+               "context_management", "output_config"}
+    if set(payload) - allowed:
+        raise ValueError("Unsupported Messages parameter: " + sorted(set(payload) - allowed)[0])
+    notes = []
+    if payload.get("metadata"):
+        notes.append("metadata")
+    if payload.get("service_tier"):
+        notes.append("service_tier")
+    if request.headers.get("anthropic-beta"):
+        notes.append("anthropic-beta")
+    context = payload.get("context_management")
+    if context is not None:
+        # Keep-all is the stateless behavior already implemented by this adapter.
+        # Actual clearing/compaction requires a separate, explicit implementation.
+        if not isinstance(context, dict) or set(context) - {"edits"}:
+            raise ValueError("Unsupported context_management parameter")
+        edits = context.get("edits", [])
+        if not isinstance(edits, list) or any(
+            not isinstance(edit, dict)
+            or set(edit) != {"type", "keep"}
+            or edit.get("type") != "clear_thinking_20251015"
+            or edit.get("keep") != "all"
+            for edit in edits
+        ):
+            raise ValueError("Unsupported context_management.edits; only empty edits or clear_thinking keep=all are supported")
+        notes.append("context_management(no_op_keep_all)")
+    output = payload.get("output_config")
+    if output is not None:
+        if not isinstance(output, dict) or set(output) - {"effort"}:
+            raise ValueError("Unsupported output_config parameter")
+        if "effort" in output:
+            if not isinstance(output["effort"], str) or output["effort"] not in {"low", "medium", "high", "xhigh", "max"}:
+                raise ValueError("Unsupported output_config.effort")
+            notes.append("output_config.effort(upstream_model_policy)")
+    thinking = payload.get("thinking")
+    if thinking is not None:
+        if not isinstance(thinking, dict) or not isinstance(thinking.get("type"), str) or thinking["type"] not in {"enabled", "disabled", "adaptive"}:
+            raise ValueError("Unsupported thinking configuration")
+        if set(thinking) - {"type", "budget_tokens", "display"}:
+            raise ValueError("Unsupported thinking parameter")
+        if not isinstance(thinking.get("display", "summarized"), str) or thinking.get("display", "summarized") not in {"summarized", "omitted"}:
+            raise ValueError("Unsupported thinking.display")
+        if thinking.get("type") == "disabled" and "display" in thinking:
+            raise ValueError("thinking.display requires enabled or adaptive thinking")
+    choice = payload.get("tool_choice")
+    if choice is not None:
+        if not isinstance(choice, dict) or not isinstance(choice.get("type"), str) or choice["type"] not in {"auto", "any", "tool", "none"}:
+            raise ValueError("Unsupported tool_choice")
+        if set(choice) - {"type", "name", "disable_parallel_tool_use"}:
+            raise ValueError("Unsupported tool_choice parameter")
+        if choice.get("type") == "tool" and not isinstance(choice.get("name"), str):
+            raise ValueError("tool_choice.name is required")
+        if choice.get("disable_parallel_tool_use"):
+            notes.append("tool_choice.disable_parallel_tool_use")
+    tool_names = {}
+    for tool in payload.get("tools") or []:
+        if tool.get("type") not in (None, "custom"):
+            raise ValueError("Built-in Anthropic tools are not supported")
+        if set(tool) - {"type", "name", "description", "input_schema", "cache_control", "strict"}:
+            raise ValueError("Unsupported tool definition parameter")
+        if not isinstance(tool.get("name"), str) or not tool["name"] or not isinstance(tool.get("input_schema", {}), dict):
+            raise ValueError("Tools require a name and object input_schema")
+        upstream = _normalize_function_name(tool["name"])
+        if upstream in tool_names:
+            raise ValueError("Tool names must be unique after normalization")
+        tool_names[upstream] = tool["name"]
+        if tool.get("strict"):
+            notes.append("tools[].strict")
+
+    entries = list(payload.get("tools") or [])
+    if isinstance(payload.get("system"), list):
+        entries.extend(payload["system"])
+    for message in payload.get("messages") or []:
+        if isinstance(message.get("content"), list):
+            for block in message["content"]:
+                if isinstance(block, dict):
+                    entries.append(block)
+                    if block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                        entries.extend(block["content"])
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if "cache_control" in entry:
+            notes.append("cache_control")
+        if "citations" in entry:
+            notes.append("citations")
+    return list(dict.fromkeys(notes)), tool_names
+
+
+def _restore_native_replay(payload: dict):
+    """Authenticate opaque omitted-thinking blocks before translating history.
+
+    Account/model checks follow normalization and credential selection. A blob
+    is never treated as an upstream signature when authentication fails.
+    """
+    restored = copy.deepcopy(payload)
+    owners = []
+    call_ids = {}
+    signed_calls = {}
+    for message in restored.get("messages") or []:
+        if not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            original = block.get("id")
+            if not isinstance(original, str):
+                continue
+            if original.startswith("call_agy1_"):
+                raise ValueError("Legacy native function replay state is not supported")
+            if not original.startswith(replay_state.CALL_ID_PREFIX):
+                continue
+            state = replay_state.decode(replay_state.PREFIX + original[len(replay_state.CALL_ID_PREFIX):])
+            if state is None or state.get("k") != "function_call":
+                raise ValueError("Invalid native function replay state")
+            name = block.get("name")
+            args = block.get("input")
+            if not isinstance(name, str) or not isinstance(args, dict) or state["n"] != _normalize_function_name(name) or state["g"] != _arguments_digest(args):
+                raise ValueError("Signed native function history was modified")
+            if state["id"] in signed_calls and signed_calls[state["id"]] != state:
+                raise ValueError("Conflicting native function replay state")
+            signed_calls[state["id"]] = state
+            call_ids[original] = encode_tool_id_with_signature(state["id"], state["s"])
+            block["id"] = call_ids[original]
+            owners.append(state)
+    for message in restored.get("messages") or []:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result":
+                original = block.get("tool_use_id")
+                if isinstance(original, str) and original.startswith((replay_state.CALL_ID_PREFIX, "call_agy1_")):
+                    if original not in call_ids:
+                        raise ValueError("Native function replay result requires its original tool_use")
+                    block["tool_use_id"] = call_ids[original]
+                continue
+            if block.get("type") != "thinking":
+                continue
+            signature = block.get("signature", block.get("thoughtSignature"))
+            if "signature" in block and "thoughtSignature" in block and block["signature"] != block["thoughtSignature"]:
+                raise ValueError("thinking signature aliases disagree")
+            if not isinstance(signature, str):
+                continue  # the converter reports malformed native blocks
+            if signature.startswith(("agy1.", replay_state.PREFIX)):
+                state = replay_state.decode(signature)
+                if state is None or state.get("k") is not None:
+                    raise ValueError("Invalid or legacy native thinking replay state")
+                if block.get("thinking") != "":
+                    raise ValueError("Encrypted native thinking must be replayed unchanged with empty thinking")
+                block["thinking"] = state["t"]
+                block["signature"] = state["s"]
+                block.pop("thoughtSignature", None)
+                owners.append(state)
+            elif block.get("thinking") == "":
+                raise ValueError("Empty native thinking requires authenticated server replay state")
+    return restored, owners
+
+
 @router.post("/v1/messages")
-async def messages(
-    claude_request: ClaudeRequest,
-    request: Request,
-    _token: str = Depends(authenticate_bearer)
-):
-    """
-    处理Anthropic/Claude格式的消息请求（流式和非流式）
+async def messages(claude_request: ClaudeRequest, request: Request, _token: str = Depends(authenticate_bearer)):
+    normalized = model_to_dict(claude_request)
+    try:
+        notes, tool_names = _validate_capabilities(normalized, request)
+        normalized, owners = _restore_native_replay(normalized)
+        owner_hashes = {owner["a"] for owner in owners}
+        if len(owner_hashes) > 1:
+            raise ValueError("Replay history contains different authenticated account owners")
+        required_account_hash = next(iter(owner_hashes), None)
+        real_model = get_base_model_from_feature_model(claude_request.model)
+        normalized["model"] = real_model
+        gemini = await anthropic_to_gemini_request(normalized)
+        requested_generation = gemini.get("generationConfig", {}).copy()
+        gemini["model"] = real_model
+        gemini = await normalize_antigravity_request(gemini)
+        if any(owner["m"] != gemini.get("model") for owner in owners):
+            raise ValueError("Native thinking replay model differs from the selected model")
+        display_thinking = (normalized.get("thinking") or {}).get("display") != "omitted"
+        if not display_thinking or owners:
+            replay_state.initialize_key()
+        effective_generation = gemini.get("generationConfig") or {}
+        if normalized.get("thinking") and requested_generation.get("thinkingConfig") != effective_generation.get("thinkingConfig"):
+            notes.append("thinking(upstream_model_policy)")
+        if requested_generation.get("maxOutputTokens") != effective_generation.get("maxOutputTokens"):
+            notes.append("max_tokens(upstream_limit)")
+    except ValueError as error:
+        return _native_error(400, str(error), "invalid_request_error")
+    except replay_state.StateKeyError:
+        return _native_error(500, "Private replay state key is unavailable")
+    api_request = {"model": gemini.pop("model"), "request": gemini}
+    log_ctx = {"api_format": "anthropic", "client_ip": request.client.host if request.client else "", "client_model": claude_request.model}
+    use_anti_truncation = is_anti_truncation_model(claude_request.model) and claude_request.stream
+    choice = normalized.get("tool_choice")
+    if (use_anti_truncation and "claude" in real_model.lower()
+            and choice is not None and choice.get("type") != "auto"):
+        notes.append("tool_choice(anti_truncation_auto)")
+    if is_anti_truncation_model(claude_request.model) and not claude_request.stream:
+        notes.append("anti_truncation(non_stream)")
+    headers = {"x-agy-ignored-params": ",".join(dict.fromkeys(notes))} if notes else {}
+    selected = {"account": None}
 
-    Args:
-        claude_request: Anthropic/Claude格式的请求体
-        token: Bearer认证令牌
-    """
-    log.debug(f"[ANTIGRAVITY-ANTHROPIC] Request for model: {claude_request.model}")
+    def on_credential(email: str, final_payload: dict):
+        if not email or any(owner["a"] != replay_state.account_hash(email) for owner in owners):
+            raise HTTPException(status_code=409, detail="Selected account differs from native replay history; retain the original account or restart the conversation")
+        selected["account"] = email
 
-    # 转换为字典
-    normalized_dict = model_to_dict(claude_request)
+    def encode_signature(signature: str, text: str):
+        return replay_state.encode(api_request["model"], selected["account"], signature, text)
 
-    # 健康检查
-    if is_health_check_request(normalized_dict, format="anthropic"):
-        response = create_health_check_response(format="anthropic")
-        return JSONResponse(content=response)
+    def encode_function(tool_id: str, name: str, args: dict, signature: str):
+        blob = replay_state.encode(api_request["model"], selected["account"], signature, "",
+                                   call_id=tool_id, function_name=name, arguments_hash=_arguments_digest(args))
+        return replay_state.CALL_ID_PREFIX + blob[len(replay_state.PREFIX):]
 
-    # 处理模型名称和功能检测
-    use_anti_truncation = is_anti_truncation_model(claude_request.model)
-    real_model = get_base_model_from_feature_model(claude_request.model)
-
-    # 获取流式标志
-    is_streaming = claude_request.stream
-
-    # 对于抗截断模型的非流式请求，给出警告
-    if use_anti_truncation and not is_streaming:
-        log.warning("抗截断功能仅在流式传输时有效，非流式请求将忽略此设置")
-
-    # 更新模型名为真实模型名
-    normalized_dict["model"] = real_model
-
-    # 转换为 Gemini 格式 (使用 converter)
-    gemini_dict = await anthropic_to_gemini_request(normalized_dict)
-
-    # anthropic_to_gemini_request 不包含 model 字段，需要手动添加
-    gemini_dict["model"] = real_model
-
-    # 规范化 Gemini 请求 (使用 antigravity 模式)
-    gemini_dict = await normalize_antigravity_request(gemini_dict)
-
-    # 准备API请求格式 - 提取model并将其他字段放入request中
-    api_request = {
-        "model": gemini_dict.pop("model"),
-        "request": gemini_dict
-    }
-
-    # 请求日志上下文（api_format + 客户端 IP + 客户端原始模型名）
-    log_ctx = {
-        "api_format": "anthropic",
-        "client_ip": request.client.host if request.client else "",
-        "client_model": claude_request.model,
-    }
-
-    # ========== 非流式请求 ==========
-    if not is_streaming:
-        # 调用 API 层的非流式请求
-        response = await non_stream_request(body=api_request, log_ctx=log_ctx)
-
-        # 检查响应状态码
-        status_code = getattr(response, "status_code", 200)
-
-        # 提取响应体
-        if hasattr(response, "body"):
-            response_body = response.body.decode() if isinstance(response.body, bytes) else response.body
-        elif hasattr(response, "content"):
-            response_body = response.content.decode() if isinstance(response.content, bytes) else response.content
-        else:
-            response_body = str(response)
-
-        try:
-            gemini_response = json.loads(response_body)
-        except Exception as e:
-            log.error(f"Failed to parse Gemini response: {e}")
-            raise HTTPException(status_code=500, detail="Response parsing failed")
-
-        # 转换为 Anthropic 格式
-        anthropic_response = gemini_to_anthropic_response(
-            gemini_response,
-            real_model,
-            status_code
-        )
-
-        return JSONResponse(content=anthropic_response, status_code=status_code)
-
-    # ========== 流式请求 ==========
-
-    # ========== 流式抗截断生成器 ==========
-    async def anti_truncation_generator():
-        max_attempts = await get_anti_truncation_max_attempts()
-
-        # 首先对payload应用反截断指令
-        anti_truncation_payload = apply_anti_truncation(api_request)
-
-        first_attempt_stream = stream_request(body=anti_truncation_payload, native=False, log_ctx=log_ctx)
-        try:
-            first_chunk = await read_first_async_item(first_attempt_stream)
-        except StopAsyncIteration:
-            return
-
-        if isinstance(first_chunk, Response):
-            yield first_chunk
-            return
-
-        first_attempt_pending = True
-
-        async def stream_request_wrapper(payload):
-            nonlocal first_attempt_pending
-
-            if first_attempt_pending:
-                first_attempt_pending = False
-                stream_gen = prepend_async_item(first_chunk, first_attempt_stream)
-            else:
-                stream_gen = stream_request(body=payload, native=False, log_ctx=log_ctx)
-            return StreamingResponse(stream_gen, media_type="text/event-stream")
-
-        # 创建反截断处理器
-        processor = AntiTruncationStreamProcessor(
-            stream_request_wrapper,
-            anti_truncation_payload,
-            max_attempts,
-        )
-
-        # 包装以确保是bytes流
-        async def bytes_wrapper():
-            async for chunk in processor.process_stream():
-                if isinstance(chunk, str):
-                    yield chunk.encode('utf-8')
-                else:
-                    yield chunk
-
-        # 直接将整个流传递给转换器
-        async for anthropic_chunk in gemini_stream_to_anthropic_stream(
-            bytes_wrapper(),
-            real_model,
-            200
-        ):
-            if anthropic_chunk:
-                yield anthropic_chunk
-
-    # ========== 普通流式生成器 ==========
-    async def normal_stream_generator():
-        # 调用 API 层的流式请求（不使用 native 模式）
-        stream_gen = stream_request(body=api_request, native=False, log_ctx=log_ctx)
-        try:
-            first_chunk = await read_first_async_item(stream_gen)
-        except StopAsyncIteration:
-            return
-
-        if isinstance(first_chunk, Response):
-            yield first_chunk
-            return
-
-        # 包装流式生成器以处理错误响应
-        async def gemini_chunk_wrapper():
-            async for chunk in prepend_async_item(first_chunk, stream_gen):
-                # 检查是否是Response对象（错误情况）
-                if isinstance(chunk, Response):
-                    # 错误响应，不进行转换，直接传递
-                    try:
-                        error_content = chunk.body if isinstance(chunk.body, bytes) else (chunk.body or b'').encode('utf-8')
-                        gemini_error = json.loads(error_content.decode('utf-8'))
-                        anthropic_error = gemini_to_anthropic_response(
-                            gemini_error,
-                            real_model,
-                            chunk.status_code
-                        )
-                        yield f"data: {json.dumps(anthropic_error)}\n\n".encode('utf-8')
-                    except Exception:
-                        yield f"data: {json.dumps({'type': 'error', 'error': {'type': 'api_error', 'message': 'Stream error'}})}\n\n".encode('utf-8')
-                    yield b"data: [DONE]\n\n"
-                    return
-                else:
-                    # 确保是bytes类型
-                    if isinstance(chunk, str):
-                        yield chunk.encode('utf-8')
-                    else:
-                        yield chunk
-
-        # 使用转换器处理整个流
-        async for anthropic_chunk in gemini_stream_to_anthropic_stream(
-            gemini_chunk_wrapper(),
-            real_model,
-            200
-        ):
-            if anthropic_chunk:
-                yield anthropic_chunk
-
-    # ========== 根据模式选择生成器 ==========
+    def stream(payload):
+        return stream_request(body=payload, native=False, log_ctx=log_ctx, on_credential=on_credential,
+                              required_account_hash=required_account_hash)
     if use_anti_truncation:
-        log.info("启用流式抗截断功能")
-        return await build_streaming_response_or_error(anti_truncation_generator())
+        api_request = apply_anti_truncation(api_request)
+    iterator = stream(api_request)
+    try:
+        first = await read_first_async_item(iterator)
+    except StopAsyncIteration:
+        await close_async_iterator(iterator)
+        return _native_error(502, "Upstream returned no data", headers=headers)
+    except HTTPException as error:
+        await close_async_iterator(iterator)
+        return _native_error(error.status_code, str(error.detail), "invalid_request_error", headers=headers)
+    except Exception as error:
+        await close_async_iterator(iterator)
+        log.error(f"[ANTHROPIC] Upstream request failed: {type(error).__name__}")
+        return _native_error(502, "Upstream request failed", headers=headers)
+    if isinstance(first, Response):
+        await close_async_iterator(iterator)
+        response = _upstream_error(first)
+        response.headers.update(headers)
+        return response
+    source = prepend_async_item(first, iterator)
+    if use_anti_truncation:
+        first_pending = True
+
+        async def continuation(payload):
+            nonlocal first_pending
+            if first_pending:
+                first_pending = False
+                body_stream = source
+            else:
+                body_stream = stream(payload)
+            return ManagedStreamingResponse(body_stream, media_type="text/event-stream")
+
+        source_stream = AntiTruncationStreamProcessor(continuation, api_request, await get_anti_truncation_max_attempts()).process_stream()
     else:
-        return await build_streaming_response_or_error(normal_stream_generator())
+        source_stream = source
+    if not claude_request.stream:
+        try:
+            response = await aggregate_gemini_to_anthropic(source_stream, claude_request.model, tool_names, display_thinking, encode_signature, encode_function)
+            return JSONResponse(content=response, headers=headers)
+        except AnthropicStreamError as error:
+            response = _native_error(error.status_code, str(error))
+            response.headers.update(headers)
+            return response
+        except Exception as error:
+            log.error(f"[ANTHROPIC] Response aggregation failed: {type(error).__name__}")
+            return _native_error(502, "Upstream stream failed")
+        finally:
+            await close_async_iterator(source_stream)
+    return ManagedStreamingResponse(
+        gemini_stream_to_anthropic_stream(source_stream, claude_request.model, tool_names=tool_names,
+                                        display_thinking=display_thinking, signature_encoder=encode_signature,
+                                        function_encoder=encode_function),
+        media_type="text/event-stream", headers=headers)
 
 
 @router.post("/v1/messages/count_tokens")
@@ -286,7 +395,7 @@ async def count_tokens(
     except Exception as e:
         return JSONResponse(
             status_code=400,
-            content={"type": "error", "error": {"type": "invalid_request_error", "message": f"JSON 解析失败: {str(e)}"}}
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": "Request body must be valid JSON"}}
         )
 
     if not isinstance(payload, dict):
@@ -301,37 +410,13 @@ async def count_tokens(
             content={"type": "error", "error": {"type": "invalid_request_error", "message": "缺少必填字段：model / messages"}}
         )
 
-    try:
-        client_host = request.client.host if request.client else "unknown"
-        client_port = request.client.port if request.client else "unknown"
-    except Exception:
-        client_host = "unknown"
-        client_port = "unknown"
-
-    thinking_present = "thinking" in payload
-    thinking_value = payload.get("thinking")
-    thinking_summary = None
-    if thinking_present:
-        if isinstance(thinking_value, dict):
-            thinking_summary = {
-                "type": thinking_value.get("type"),
-                "budget_tokens": thinking_value.get("budget_tokens"),
-            }
-        else:
-            thinking_summary = thinking_value
-
-    user_agent = request.headers.get("user-agent", "")
-    log.info(
-        f"[ANTIGRAVITY-ANTHROPIC] /messages/count_tokens 收到请求: client={client_host}:{client_port}, "
-        f"model={payload.get('model')}, messages={len(payload.get('messages') or [])}, "
-        f"thinking_present={thinking_present}, thinking={thinking_summary}, ua={user_agent}"
-    )
+    log.debug("[ANTHROPIC] Token estimate request accepted")
 
     # 简单估算
     input_tokens = 0
     try:
         input_tokens = estimate_input_tokens(payload)
     except Exception as e:
-        log.error(f"[ANTIGRAVITY-ANTHROPIC] token 估算失败: {e}")
+        log.error(f"[ANTHROPIC] Token estimation failed: {type(e).__name__}")
 
-    return JSONResponse(content={"input_tokens": input_tokens})
+    return JSONResponse(content={"input_tokens": input_tokens}, headers={"x-agy-token-count-estimated": "true"})

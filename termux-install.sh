@@ -141,29 +141,8 @@ else
     cd ./agy2api
 fi
 
-echo "强制同步项目代码，忽略本地修改..."
-git fetch --all
-git reset --hard origin/$(git rev-parse --abbrev-ref HEAD)
+# 保留现有 checkout；代码更新应独立进行，避免覆盖本地修改。
 
-# 只在不存在时创建
-if [ ! -d ".venv" ]; then
-    echo "创建虚拟环境..."
-    PYTHON_VERSION=$(python -V 2>&1 | grep -oP '\d+\.\d+' | head -1)
-    if [ -n "$PYTHON_VERSION" ]; then
-        echo "检测到 Python $PYTHON_VERSION，固定版本..."
-        uv python pin "$PYTHON_VERSION"
-    fi
-    rm pyproject.toml
-    uv init
-    uv venv
-else
-    echo "虚拟环境已存在，跳过创建"
-fi
-
-echo "安装 Python 依赖..."
-uv add -r requirements.txt
-
-echo "激活虚拟环境并启动服务..."
-source .venv/bin/activate
-pm2 start .venv/bin/python --name web -- web.py
-cd ..
+# Keep project metadata and resolve only the reviewed lockfile.
+uv sync --locked --no-dev --python "$(command -v python)"
+pm2 start .venv/bin/python --name agy2api -- web.py

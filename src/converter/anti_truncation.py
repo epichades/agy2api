@@ -3,9 +3,9 @@ Anti-Truncation Module - Synthetic Tool Call Approach
 通过注入合成工具（emit_answer）让模型将最终回答放入 functionCall 的 content 参数中，
 网关再从 functionCall 中提取内容还原为普通 assistant 文本，以此绕过外审截断。
 
-强制手段：toolConfig.functionCallingConfig.mode=ANY + allowedFunctionNames
-在结构上要求模型调用允许的工具之一（含 emit_answer），提示词仅作为内容质量说明；
-上游忽略 toolConfig 时由流式处理器兜底（透传普通文本 / 续传）。
+Gemini 函数工具使用 ANY + allowedFunctionNames；Claude 使用 AUTO 加提示词，
+避免不支持强制工具的模型报错，以及强制工具跳过模型原有 thinking。
+存在内置工具时同样使用 AUTO；流式处理器兼容普通文本和合成工具输出。
 
 参考: https://github.com/Xeltra233/Antigravity-anti-truncation-gateway
 """
@@ -15,10 +15,19 @@ import json
 import re
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
+from log import log
+
 from fastapi import Response as FastAPIResponse
 from fastapi.responses import StreamingResponse
 
 from src.converter.thoughtSignature_fix import SKIP_THOUGHT_SIGNATURE_VALIDATOR
+from src.router.stream_passthrough import close_async_iterator
+
+
+
+def _privacy_print(message: str, *, flush: bool = False) -> None:
+    """Keep conversion diagnostics behind the application's log policy."""
+    log.info(message)
 
 # ==================== 合成工具配置 ====================
 
@@ -95,13 +104,16 @@ def _has_non_function_tool(tools: List[Dict[str, Any]]) -> bool:
     return False
 
 
-def _resolve_function_calling_mode(tools: List[Dict[str, Any]]) -> Tuple[str, bool]:
+def _resolve_function_calling_mode(tools: List[Dict[str, Any]], model: str = "") -> Tuple[str, bool]:
     """决定注入的 functionCallingConfig。
 
-    默认注入 ANY + allowedFunctionNames（含 emit_answer）做结构级强制；
+    Claude 不强制工具调用：部分模型拒绝 ANY，其余模型强制调用时会跳过 thinking。
+    其他模型默认注入 ANY + allowedFunctionNames（含 emit_answer）做结构级强制；
     存在无法枚举的非函数工具（googleSearch 等）时 allowedFunctionNames
     会 block 内置能力，自动回退 AUTO。
     """
+    if "claude" in model.lower():
+        return "AUTO", False
     if not _has_non_function_tool(tools):
         return "ANY", True
     return "AUTO", False
@@ -138,13 +150,14 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
         tools.append({"functionDeclarations": [SYNTHETIC_TOOL_DECLARATION]})
         request_data["tools"] = tools
 
-    # 2. 注入 toolConfig.functionCallingConfig，结构上强制模型调用 emit_answer
+    # 2. 依模型能力选择合成工具策略，不改动模型或 thinking 配置。
     #    深拷贝 toolConfig：避免内层 dict 与调用方共享引用被原地改写污染
     tool_config = json.loads(
         json.dumps(request_data.get("toolConfig") or {}, ensure_ascii=False)
     )
     func_config = dict(tool_config.get("functionCallingConfig") or {})
-    mode, use_allowed = _resolve_function_calling_mode(tools)
+    is_claude = "claude" in str(payload.get("model") or "").lower()
+    mode, use_allowed = _resolve_function_calling_mode(tools, str(payload.get("model") or ""))
     func_config["mode"] = mode
     if use_allowed:
         # 合并调用方已有的 allowedFunctionNames（若有），统一去重保序
@@ -159,17 +172,19 @@ def apply_anti_truncation(payload: Dict[str, Any]) -> Dict[str, Any]:
         func_config["allowedFunctionNames"] = merged
         tool_config["functionCallingConfig"] = func_config
         request_data["toolConfig"] = tool_config
-        print(
-            f"Anti-truncation: toolConfig mode=ANY allowedFunctionNames={merged}",
+        _privacy_print(
+            f"Anti-truncation: toolConfig mode=ANY allowedFunctionCount={len(merged)}",
             flush=True,
         )
     else:
-        # AUTO 回退：保留调用方原有配置，仅覆盖 mode
+        # AUTO relies on the prompt, not a forced/restricted tool selection.
+        # Retaining an old allowlist would still restrict the helper or built-ins.
+        func_config.pop("allowedFunctionNames", None)
         tool_config["functionCallingConfig"] = func_config
         request_data["toolConfig"] = tool_config
-        print(
-            "Anti-truncation: toolConfig mode=AUTO (non-function tools present), "
-            "relying on instruction only",
+        reason = "Claude preserves model thinking" if is_claude else "non-function tools present"
+        _privacy_print(
+            f"Anti-truncation: toolConfig mode=AUTO ({reason}), relying on instruction only",
             flush=True,
         )
 
@@ -434,6 +449,7 @@ class AntiTruncationStreamProcessor:
         original_request_func,
         payload: Dict[str, Any],
         max_attempts: int = 3,
+        aggregate_usage: bool = False,
     ):
         self.original_request_func = original_request_func
         # 深拷贝 request/contents/messages：本类在续传时会向其中追加内容，
@@ -445,6 +461,8 @@ class AntiTruncationStreamProcessor:
         # 整个请求期间是否有文本实时透传给客户端
         # （异常兜底时判断 salvaged 文本是否已发过，避免重发）
         self.forwarded_any_text = False
+        self.aggregate_usage = aggregate_usage
+        self._attempt_usage: Dict[int, Dict[str, int]] = {}
 
     def _get_collected_text(self) -> str:
         """获取收集的文本内容"""
@@ -461,6 +479,54 @@ class AntiTruncationStreamProcessor:
         self.collected_content = io.StringIO()
 
     async def process_stream(self) -> AsyncGenerator[bytes, None]:
+        """Optionally emit one complete usage total across continuation attempts.
+
+        Raw per-attempt counters are withheld in this mode: after an attempt
+        with missing counters, a later successful attempt is not a full total.
+        Other protocol adapters retain their existing streaming behavior.
+        """
+        source = self._process_stream()
+        failed = False
+        try:
+            async for chunk in source:
+                if not self.aggregate_usage or isinstance(chunk, FastAPIResponse):
+                    yield chunk
+                    continue
+                text = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+                if text.strip() == "data: [DONE]":
+                    if not failed:
+                        complete = all(
+                            "totalTokenCount" in self._attempt_usage.get(attempt, {})
+                            for attempt in range(1, self.current_attempt + 1)
+                        )
+                        if complete and self.current_attempt:
+                            snapshots = list(self._attempt_usage.values())
+                            # Only sum fields provided by every attempt. Missing
+                            # per-attempt usage never silently counts as zero.
+                            keys = set.intersection(*(set(item) for item in snapshots))
+                            usage = {key: sum(item[key] for item in snapshots) for key in keys}
+                            final = {"usageMetadata": usage}
+                        else:
+                            final = {"x_agy_usage_incomplete": True}
+                        yield f"data: {json.dumps(final)}\n\n".encode("utf-8")
+                    yield chunk
+                    continue
+                try:
+                    data = json.loads(text.strip()[6:]) if text.startswith("data: ") else None
+                except (ValueError, TypeError):
+                    data = None
+                if isinstance(data, dict):
+                    inner = data.get("response", data)
+                    if isinstance(inner, dict):
+                        failed = failed or bool(inner.get("error"))
+                        if "usageMetadata" in inner:
+                            inner.pop("usageMetadata")
+                            chunk = f"data: {json.dumps(data)}\n\n".encode("utf-8")
+                yield chunk
+        finally:
+            await close_async_iterator(source)
+
+    async def _process_stream(self) -> AsyncGenerator[bytes, None]:
         """处理流式响应，检测并处理截断"""
 
         while self.current_attempt < self.max_attempts:
@@ -476,6 +542,8 @@ class AntiTruncationStreamProcessor:
             last_finish_reason: Optional[str] = None
             # finishReason 是否已透传给客户端（避免收尾时重复补发）
             finish_reason_forwarded = False
+            real_tool_forwarded = False
+            response = None
 
             try:
                 response = await self.original_request_func(current_payload)
@@ -498,7 +566,7 @@ class AntiTruncationStreamProcessor:
 
                     # 处理上游生成器 yield 出 Response 对象的情况（错误响应）
                     if isinstance(line, FastAPIResponse):
-                        print(
+                        _privacy_print(
                             f"Anti-truncation: Received Response object from stream "
                             f"(status={line.status_code}), treating as error",
                             flush=True,
@@ -534,6 +602,10 @@ class AntiTruncationStreamProcessor:
 
                         # 检查是否是 [DONE] 标记
                         if payload_str.strip() == "[DONE]":
+                            if real_tool_forwarded:
+                                # A later synthetic tool does not authorize a
+                                # fabricated finish or another real-tool attempt.
+                                break
                             if found_synthetic:
                                 if (
                                     last_finish_reason in TRUNCATION_FINISH_REASONS
@@ -542,7 +614,7 @@ class AntiTruncationStreamProcessor:
                                     # synthetic 内容被截断：不结束流，break 走
                                     # 流末统一判定续传（side_buffer 由流末处理）
                                     break
-                                print(
+                                _privacy_print(
                                     f"Anti-truncation: outcome=synthetic_hit "
                                     f"(attempt {self.current_attempt}, "
                                     f"content length: {len(self._get_collected_text())}, "
@@ -557,7 +629,7 @@ class AntiTruncationStreamProcessor:
                                 yield line
                                 return
                             else:
-                                print(
+                                _privacy_print(
                                     f"Anti-truncation: outcome=no_synthetic_eot "
                                     f"(attempt {self.current_attempt}, "
                                     f"forwarded text length: {len(side_buffer.getvalue())}), "
@@ -574,6 +646,20 @@ class AntiTruncationStreamProcessor:
                             yield line
                             continue
 
+                        if self.aggregate_usage:
+                            inner = data.get("response", data)
+                            usage = inner.get("usageMetadata")
+                            if isinstance(usage, dict):
+                                # Within one attempt these are cumulative
+                                # snapshots, not deltas; replace each counter.
+                                counters = {
+                                    key: value for key, value in usage.items()
+                                    if key.endswith("TokenCount")
+                                    and isinstance(value, int) and not isinstance(value, bool)
+                                    and value >= 0
+                                }
+                                self._attempt_usage.setdefault(self.current_attempt, {}).update(counters)
+
                         # 回传前把真实 thoughtSignature 替换为跳过校验占位符，
                         # 替换后重算 line，保证后续原样透传分支也携带脱敏数据
                         if _replace_thought_signatures(data):
@@ -585,6 +671,12 @@ class AntiTruncationStreamProcessor:
                         synthetic_content, chunk_has_synthetic = (
                             extract_synthetic_content_from_response(data)
                         )
+                        # A single frame may contain both the helper and a real
+                        # tool. The helper conversion retains real calls, so the
+                        # no-replay boundary applies before either branch emits.
+                        chunk_has_real_tool = _chunk_has_real_function_call(data)
+                        if chunk_has_real_tool:
+                            real_tool_forwarded = True
 
                         if chunk_has_synthetic:
                             found_synthetic = True
@@ -598,7 +690,7 @@ class AntiTruncationStreamProcessor:
                             # 若模型先输出普通文本又转用合成工具，则视为内容冲突，
                             # 丢弃已透传的普通文本并输出告警（客户端会看到合成工具内容）
                             if side_buffer.getvalue():
-                                print(
+                                _privacy_print(
                                     "Anti-truncation: Model output plain text before "
                                     "synthetic tool call, synthetic content wins "
                                     "(forwarded text conflicts and is dropped)",
@@ -610,10 +702,13 @@ class AntiTruncationStreamProcessor:
                             # 收集内容用于续传
                             self._append_content(synthetic_content)
 
-                            # 构建 chunk：截断原因（MAX_TOKENS）剥离后透传——
-                            # 客户端见到 MAX_TOKENS 会判定流被截断而提前终止，
-                            # 是否截断续传由网关决定，收尾统一补发 STOP
-                            is_truncated = chunk_finish in TRUNCATION_FINISH_REASONS
+                            # Only withhold truncation while continuation is
+                            # safe. Once any real tool is delivered, preserve
+                            # the upstream finish reason, including MAX_TOKENS.
+                            is_truncated = (
+                                chunk_finish in TRUNCATION_FINISH_REASONS
+                                and not real_tool_forwarded
+                            )
                             if is_truncated:
                                 stripped_data = self._strip_finish_reason(data)
                                 modified_data = build_text_chunk_from_synthetic(
@@ -634,12 +729,25 @@ class AntiTruncationStreamProcessor:
                                 last_finish_reason = chunk_finish
                                 finish_reason_forwarded = True
 
-                        elif _chunk_has_real_function_call(data):
+                        elif chunk_has_real_tool:
+                            # 真实工具调用已交付，不能再通过续传请求重新生成它。
                             # 真实工具调用，原样透传
                             chunk_finish = self._get_finish_reason(data)
                             if chunk_finish:
                                 last_finish_reason = chunk_finish
                                 # 原样透传的 chunk 自带 finishReason
+                                finish_reason_forwarded = True
+                            yield line
+
+                        elif real_tool_forwarded:
+                            # A real tool call makes this attempt non-replayable.
+                            # Its finish event may arrive in a later frame; do not
+                            # withhold it in the plain-text continuation branch.
+                            # Forward the original frame (including candidate
+                            # indices/metadata), followed by any late usage.
+                            chunk_finish = self._get_finish_reason(data)
+                            if chunk_finish:
+                                last_finish_reason = chunk_finish
                                 finish_reason_forwarded = True
                             yield line
 
@@ -657,6 +765,17 @@ class AntiTruncationStreamProcessor:
                                         stripped, separators=(",", ":"), ensure_ascii=False
                                     )
                                     yield f"data: {json_str}\n\n".encode("utf-8")
+                                else:
+                                    # Usage may arrive separately after STOP. Preserve
+                                    # an actual usage-only event, without forwarding
+                                    # suppressed text/tools or inventing completion.
+                                    inner = data.get("response", data)
+                                    if (
+                                        isinstance(inner.get("usageMetadata"), dict)
+                                        and not inner.get("candidates")
+                                        and not inner.get("error")
+                                    ):
+                                        yield line
                                 continue
                             else:
                                 # 模型未走合成工具、直接输出普通文本：
@@ -695,11 +814,17 @@ class AntiTruncationStreamProcessor:
                 side_text = side_buffer.getvalue()
                 side_buffer.close()
 
+                if real_tool_forwarded:
+                    # 保留上游实际 finishReason；缺少收尾由调用方报告失败，不能补造 STOP。
+                    self._clear_content()
+                    yield b"data: [DONE]\n\n"
+                    return
+
                 if found_synthetic:
                     if last_finish_reason in TRUNCATION_FINISH_REASONS and self.current_attempt < self.max_attempts:
                         # ANY 强制后截断发生在 emit_answer 内部：
                         # synthetic 内容不完整，继续续传补全
-                        print(
+                        _privacy_print(
                             f"Anti-truncation: outcome=synthetic_truncated "
                             f"(attempt {self.current_attempt} -> {self.current_attempt + 1}, "
                             f"content length: {len(self._get_collected_text())}, "
@@ -709,7 +834,7 @@ class AntiTruncationStreamProcessor:
                         continue
                     content_len = len(self._get_collected_text())
                     self._clear_content()
-                    print(
+                    _privacy_print(
                         f"Anti-truncation: outcome=synthetic_hit "
                         f"(attempt {self.current_attempt}, stream ended without [DONE], "
                         f"content length: {content_len}, "
@@ -725,7 +850,7 @@ class AntiTruncationStreamProcessor:
                 # 模型自然结束（STOP）且未调用合成工具：视为完整回答，不再续传
                 # （续传会让模型重发一遍已有内容，浪费上游请求且可能产生重复文本）
                 if last_finish_reason == "STOP":
-                    print(
+                    _privacy_print(
                         f"Anti-truncation: outcome=stop_plain_text "
                         f"(attempt {self.current_attempt}, "
                         f"text length: {len(side_text)}, finishReason=STOP "
@@ -746,7 +871,7 @@ class AntiTruncationStreamProcessor:
                 # 触发续传
                 if self.current_attempt < self.max_attempts:
                     accumulated_text = self._get_collected_text()
-                    print(
+                    _privacy_print(
                         f"Anti-truncation: outcome=continuation "
                         f"(attempt {self.current_attempt} -> {self.current_attempt + 1}, "
                         f"accumulated length: {len(accumulated_text)}, "
@@ -755,7 +880,7 @@ class AntiTruncationStreamProcessor:
                     )
                     continue
                 else:
-                    print(
+                    _privacy_print(
                         f"Anti-truncation: outcome=max_attempts_reached "
                         f"(attempt {self.current_attempt}, "
                         f"forwarded text length: {len(side_text)})",
@@ -769,69 +894,30 @@ class AntiTruncationStreamProcessor:
                     return
 
             except Exception as e:
-                print(
+                _privacy_print(
                     f"Anti-truncation: outcome=error "
-                    f"(attempt {self.current_attempt}): {str(e)}",
+                    f"(attempt {self.current_attempt}): {type(e).__name__}",
                     flush=True,
                 )
-
-                # 异常中断：把本轮已收到的文本并入收集器，作为续传历史
-                # （否则续传请求不知道模型已输出到哪，可能从头重复输出）
-                try:
-                    interrupted_text = side_buffer.getvalue()
-                except ValueError:
-                    # 正常路径已 close 后又抛错：文本此前已并入收集器
-                    interrupted_text = ""
-                try:
-                    side_buffer.close()
-                except ValueError:
-                    pass
-                if interrupted_text:
-                    print(
-                        f"Anti-truncation: Stream interrupted, salvaging "
-                        f"{len(interrupted_text)} chars of buffered text into continuation history",
-                        flush=True,
-                    )
-                    self._append_content(interrupted_text)
-
-                if self.current_attempt >= self.max_attempts:
-                    # 重试额度用尽：已实时透传的文本不重复输出，仅补收尾信号
-                    salvaged = self._get_collected_text()
-                    self._clear_content()
-                    if salvaged and self.forwarded_any_text:
-                        print(
-                            f"Anti-truncation: Max attempts reached after error, "
-                            f"salvaged text already forwarded (length: {len(salvaged)})",
-                            flush=True,
-                        )
-                        if not finish_reason_forwarded:
-                            yield self._build_finish_reason_chunk(last_finish_reason or "STOP")
-                    elif salvaged:
-                        # 未透传过的内容（如合成工具收集的部分）：作为 fallback 输出
-                        print(
-                            f"Anti-truncation: Max attempts reached after error, "
-                            f"yielding salvaged text (length: {len(salvaged)})",
-                            flush=True,
-                        )
-                        fallback_chunk = self._build_fallback_text_chunk(salvaged)
-                        if fallback_chunk:
-                            yield fallback_chunk
-                    else:
-                        error_chunk = {
-                            "error": {
-                                "message": f"Anti-truncation failed: {str(e)}",
-                                "type": "api_error",
-                                "code": 500,
-                            }
-                        }
-                        yield f"data: {json.dumps(error_chunk)}\n\n".encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                # 还有重试额度：继续下一轮续传
-                continue
+                # 续传只针对明确的模型截断；传输失败不能伪装成成功或重新生成工具。
+                self._clear_content()
+                error_chunk = {
+                    "error": {
+                        "message": "Upstream stream interrupted during continuation",
+                        "type": "api_error",
+                        "code": 502,
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+            finally:
+                side_buffer.close()
+                if isinstance(response, StreamingResponse):
+                    await close_async_iterator(response.body_iterator)
 
         # 所有尝试都失败
-        print("Anti-truncation: outcome=all_attempts_failed", flush=True)
+        _privacy_print("Anti-truncation: outcome=all_attempts_failed", flush=True)
         self._clear_content()
         yield b"data: [DONE]\n\n"
 
@@ -1002,7 +1088,7 @@ class AntiTruncationStreamProcessor:
             try:
                 # 特殊处理：如果返回的是 StreamingResponse
                 if isinstance(response, StreamingResponse):
-                    print(
+                    _privacy_print(
                         "Anti-truncation: Received StreamingResponse in non-streaming handler",
                         flush=True,
                     )
@@ -1023,11 +1109,11 @@ class AntiTruncationStreamProcessor:
                         else response.content
                     )
                 else:
-                    print(f"Anti-truncation: Unknown response type: {type(response)}", flush=True)
+                    _privacy_print(f"Anti-truncation: Unknown response type: {type(response)}", flush=True)
                     content = str(response)
 
                 if not content or not content.strip():
-                    print("Anti-truncation: Received empty response content", flush=True)
+                    _privacy_print("Anti-truncation: Received empty response content", flush=True)
                     return json.dumps(
                         {
                             "error": {
@@ -1041,16 +1127,15 @@ class AntiTruncationStreamProcessor:
                 try:
                     response_data = json.loads(content)
                 except json.JSONDecodeError as json_err:
-                    print(
-                        f"Anti-truncation: Failed to parse JSON response: {json_err}, "
-                        f"content: {content[:200]}",
+                    _privacy_print(
+                        f"Anti-truncation: Failed to parse JSON response: {type(json_err).__name__}",
                         flush=True,
                     )
                     return content.encode() if isinstance(content, str) else content
 
                 # 上游错误响应：直接透传错误，不再续传
                 if isinstance(response_data, dict) and "error" in response_data:
-                    print(
+                    _privacy_print(
                         f"Anti-truncation: Upstream error response "
                         f"(status={getattr(response, 'status_code', 'unknown')})",
                         flush=True,
@@ -1087,13 +1172,13 @@ class AntiTruncationStreamProcessor:
                     if text:
                         self._append_content(text)
 
-                print("Anti-truncation: Non-streaming response needs continuation", flush=True)
+                _privacy_print("Anti-truncation: Non-streaming response needs continuation", flush=True)
                 self.current_attempt += 1
                 next_payload = self._build_current_payload()
                 response = await self.original_request_func(next_payload)
 
             except Exception as e:
-                print(f"Anti-truncation non-streaming error: {str(e)}", flush=True)
+                _privacy_print(f"Anti-truncation non-streaming error: {type(e).__name__}", flush=True)
                 return json.dumps(
                     {
                         "error": {

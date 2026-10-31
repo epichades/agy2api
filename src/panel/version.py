@@ -3,6 +3,9 @@
 """
 
 import os
+from pathlib import Path
+import re
+import subprocess
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
@@ -14,6 +17,38 @@ from src.httpx_client import get_async
 
 # 创建路由器
 router = APIRouter(prefix="/version", tags=["version"])
+
+
+def _read_build_identity():
+    """Capture the deployed source identity at process import, not after a pull.
+
+    Archives/containers should supply AGY_BUILD_SHA. version.txt remains the
+    upstream version record and is never treated as this fork's build identity.
+    """
+    explicit = os.environ.get("AGY_BUILD_SHA", "").strip()
+    if explicit:
+        if re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", explicit):
+            return {"commit": explicit.lower(), "source": "environment", "dirty": None}
+        return {"commit": None, "source": "invalid_environment", "dirty": None}
+    root = Path(__file__).resolve().parents[2]
+    try:
+        # Do not accidentally report the commit of a containing parent checkout.
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=2, check=True).stdout.strip()
+        if Path(top).resolve() != root:
+            raise ValueError("Not a project checkout")
+        commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=2, check=True).stdout.strip()
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit):
+            raise ValueError("Invalid commit")
+        dirty = subprocess.run(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True, timeout=2, check=True).stdout
+        return {"commit": commit, "source": "git", "dirty": bool(dirty)}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"commit": None, "source": "unavailable", "dirty": None}
+
+
+_BUILD_IDENTITY = _read_build_identity()
 
 
 @router.get("/info")
@@ -56,6 +91,7 @@ async def get_version_info(check_update: bool = False):
             "message": version_data.get('message', ''),
             "date": version_data.get('date', '')
         }
+        response_data["build"] = dict(_BUILD_IDENTITY)
 
         # 如果需要检查更新
         if check_update:
