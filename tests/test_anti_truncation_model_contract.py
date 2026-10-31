@@ -335,3 +335,45 @@ async def test_real_tool_does_not_bypass_later_synthetic_tool_conversion(gateway
         assert events[-1]["type"] == ("response.completed" if has_finish else "response.failed")
         messages = [item for item in events[-1]["response"]["output"] if item["type"] == "message"]
         assert messages[0]["content"][0]["text"] == "synthetic final"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["chat", "responses"])
+@pytest.mark.parametrize("finish", ["STOP", "MAX_TOKENS", None])
+@pytest.mark.parametrize("separate_finish", [False, True])
+async def test_mixed_real_and_synthetic_frame_cannot_replay_or_invent_finish(
+    gateway, protocol, finish, separate_finish,
+):
+    client, state = gateway
+    candidate = {"index": 0, "content": {"parts": [
+        {"functionCall": {"name": "emit_answer", "args": {"content": "synthetic final"}}},
+        {"functionCall": {"name": "real_tool", "id": "synthetic-call", "args": {"value": "true"}}},
+    ]}}
+    if finish and not separate_finish:
+        candidate["finishReason"] = finish
+    wire = _data({"response": {"candidates": [candidate]}})
+    if finish and separate_finish:
+        wire += _data({"candidates": [{"index": 0, "finishReason": finish}]})
+    wire += _data({"usageMetadata": {"promptTokenCount": 2, "candidatesTokenCount": 3, "totalTokenCount": 5}})
+    state.attempts = [wire + b"data: [DONE]\n\n"]
+    response = await _call_real_tool(client, protocol)
+    events = _real_tool_events(response, protocol)
+    assert len(state.requests) == 1
+    assert '"emit_answer"' not in response.text
+    if protocol == "chat":
+        choices = [choice for event in events for choice in event.get("choices", [])]
+        assert "".join(choice.get("delta", {}).get("content", "") for choice in choices) == "synthetic final"
+        finishes = [choice["finish_reason"] for choice in choices if choice.get("finish_reason")]
+        assert finishes == ({"STOP": ["tool_calls"], "MAX_TOKENS": ["length"], None: []}[finish])
+        assert any("error" in event for event in events) is (finish is None)
+        if finish:
+            assert events[-1]["choices"] == [] and events[-1]["usage"]["total_tokens"] == 5
+        assert response.text.count("data: [DONE]") == 1
+    else:
+        status = {"STOP": "completed", "MAX_TOKENS": "incomplete", None: "failed"}[finish]
+        assert events[-1]["type"] == "response." + status
+        assert events[-1]["response"]["status"] == status
+        messages = [item for item in events[-1]["response"]["output"] if item["type"] == "message"]
+        assert messages[0]["content"][0]["text"] == "synthetic final"
+        if finish:
+            assert events[-1]["response"]["usage"]["total_tokens"] == 5

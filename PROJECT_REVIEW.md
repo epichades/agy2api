@@ -17,7 +17,7 @@
 | [07ec1aa](https://github.com/su-kaka/agy2api/commit/07ec1aa) | 保留設定頁修正的上游合併歷史 |
 | [6cc4562](https://github.com/su-kaka/agy2api/commit/6cc4562) | 保留上游目前版本紀錄，作為乾淨發布基底 |
 
-前端由整合後來源重新建置；沒有將上游 dist 直接覆蓋本機隱私修正。原始碼交付使用 `codex/agy2api-source`：初始乾淨快照 `46641c9` 直接以 `6cc4562` 為 parent，後續修正承接該快照；`.github/workflows` 保持與遠端原有版本一致，不新增 CI workflow，也不建立 PR 或 tag 觸發建置。CI 修改另保留於本機 `codex/agy2api-ready`，該分支未包含本節之後的修正。舊 master、原 bundle／備份 refs 與中間整合分支不推送；它們保留在本機供回復，不能使用 `push --mirror` 發布。
+前端由整合後來源重新建置；沒有將上游 dist 直接覆蓋本機隱私修正。原始碼交付使用 `codex/agy2api-source`：初始乾淨快照 `46641c9` 直接以 `6cc4562` 為 parent，後續修正承接該快照；`.github/workflows` 保持與遠端原有版本一致，不新增 CI workflow 或 tag。後續依要求在自己的 fork 建立 [PR #1](https://github.com/epichades/agy2api/pull/1)，修正與合併提交均須包含 `[skip ci]`，並核對 Actions 沒有新執行。CI 修改另保留於本機 `codex/agy2api-ready`，該分支未包含本節之後的修正。舊 master、原 bundle／備份 refs 與中間整合分支不推送；它們保留在本機供回復，不能使用 `push --mirror` 發布。
 
 此方式保留全部上游血緣，同時避免讓含舊私人部署筆記的本機 5 個提交成為發布祖先。既有公開上游歷史不在本次重寫範圍；沒有執行遠端歷史重寫或憑證撤銷。`src/api/Response_example.txt` 已取消追蹤，僅作被忽略的本機檔保留，不納入發布快照。
 
@@ -73,9 +73,24 @@
 
 `4fb6853` 已通過 Gemini／Opus 的純 Chat 串流、常見 SDK 選項、include_usage true／false、結尾用量、完整終止與工具參數型別，以及 Responses 串流／非串流與已保存的原 owner 簽章 history 重播。現場仍發現 Claude 抗截斷的強制工具選擇被拒絕，及該錯誤的 Content-Type 不正確；已在 `261d3c9` 修正，其純文字、用量及 JSON 錯誤格式已通過真實驗證。其後在帶真工具的抗截斷串流發現獨立 finish frame 被遺漏，`b33432f` 已修正並新增分段／缺失結尾／取消案例，受影響的 Chat／Responses 工具串流及普通 Opus smoke 皆於該提交第一次重測通過：工具只交付一次，沒有合成工具外漏、error 或 failed，finish／completed 與用量完整。
 
-最終程式實測提交為 `b33432f6a0ee0f99a575804d69ef718eadc410b9`；上述本機 Codex／Claude Code 合成 CLI 探針也在此提交重跑通過。後續僅更新本報告，沒有更動執行程式。所有 staging listener 已停止，正式服務保持原程式與啟動設定，備份 manifest 再次驗證通過。
+該輪真實上游實測提交為 `b33432f6a0ee0f99a575804d69ef718eadc410b9`；上述本機 Codex／Claude Code 合成 CLI 探針也在此提交重跑通過。緊接的 `011479f` 僅更新本報告；後續 PR 複查修正另列下節，不沿用此真實上游驗收結果。所有 staging listener 已停止，正式服務保持原程式與啟動設定，備份 manifest 再次驗證通過。
 
 Claude 抗截斷現在使用 AUTO 配合提示詞，保留模型和 thinking 設定；若覆寫 caller 明確工具選擇則回報 `tool_choice(anti_truncation_auto)`。普通模式仍保留強制工具選擇，供應商不支援時回正確 JSON 錯誤。此模式原有的簽章 placeholder 改寫未移除，不能宣稱 anti history 無損；保真對話應使用沒有此前綴的模型。長時間負載、完整配額／OAuth 生命週期、反向代理、正式切換和正式還原仍需另行驗收。
+
+## 2026-10-31 PR #1 合併前複查
+
+以自己的 fork `master` 為基底重新檢查全部差異，新增下列修正與 48 項 pytest 回歸：
+
+- 同一 SSE frame 同時包含真工具與 `emit_answer` 時，在轉換前設立不可重送界線；保留真正的 STOP／MAX_TOKENS，缺少 finish 時失敗。
+- Chat `n > 1` 的工具序號與結束狀態改為按 candidate 管理，一個候選結束不清掉另一個候選的歷史；取消時完整釋放。
+- Responses 的 function／custom tool 結果保留原始字串；JSON 外觀的文字、空白、重複鍵與 `1e999` 不再被解析改寫。Chat 舊行為保持，golden 合約明確驗證這個差異。
+- Responses 對重複上游工具 ID、finish 後內容、矛盾 finish 及 DONE 後資料回報失敗；正常獨立 usage 與重複相同 finish 保持可用。
+- PostgreSQL 舊資料表的索引改名保留，避免刪除 UNIQUE 約束依賴的索引而中斷升級；原資料與約束保持。
+- 面板密碼以 UTF-8 bytes 做固定時間比較，中文密碼可正常登入，錯誤／無效 Unicode 輸入不再造成 500。
+
+修正後驗證：**477 pytest 通過、15/15 golden 通過、17 項原生程序 smoke 全真**；實際 Codex 0.155.1 的 Opus／Gemini 簽章工具循環，以及 Claude Code 2.1.263 的文字／簽章 Bash 工具循環均通過，使用合成上游。前端重建與已追蹤 dist 一致，發布檔案／歷史隱私預檢及 diff 檢查通過。PR 更新與合併提交使用 `[skip ci]`，workflow 檔保持不變。
+
+本輪未操作正式服務，也未重跑真實供應商 HTTP；前一輪 Grok Bot 的真實上游結果只適用其記錄提交。PostgreSQL 修正以方言／DDL 合約驗證，沒有真實 PostgreSQL 執行環境。其餘未驗收範圍維持下節說明。
 
 ## 必須維持的設定與升級規則
 

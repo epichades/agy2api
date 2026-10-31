@@ -1,6 +1,6 @@
 # Responses API：支援範圍、回放狀態與用戶端設定
 
-更新日期：2026-10-29。本文對應目前修正分支的實作；最終 commit、完整測試數字與實際 Codex probe 結果以 [PROJECT_REVIEW.md](PROJECT_REVIEW.md) 為準。部署與私密值管理另見 [DEPLOY.md](DEPLOY.md)、[PRIVACY.md](PRIVACY.md)。
+更新日期：2026-10-31。本文對應目前修正分支的實作；最終 commit、完整測試數字與實際 Codex probe 結果以 [PROJECT_REVIEW.md](PROJECT_REVIEW.md) 為準。部署與私密值管理另見 [DEPLOY.md](DEPLOY.md)、[PRIVACY.md](PRIVACY.md)。
 
 這是 Antigravity 的 OpenAI Responses 相容轉接層。已修正已重現的工具名稱、型別、文字裁切與串流恢復問題，但不代表實現全部 OpenAI／Anthropic／Gemini API，也不保證所有上游語義都能原樣通過。無法實作的能力會拒絕，或明確回報轉換／忽略項目。
 
@@ -19,11 +19,11 @@
 |---|---|
 | 文字與輸出順序 | 保留支援的文字、空白、換行、`...`／`…`，以及思考 → 文字 → 工具等 items 的順序。只有有明確內部標記的 placeholder 會被濾除 |
 | function／namespace | 回傳原本的工具名稱與 namespace；上游名稱必要時使用穩定散列後綴維持 64 字元限制，避免舊版單純截斷造成撞名。真正重複或平坦化後有歧義的宣告會拒絕。namespace description 會加入對應工具描述 |
-| 工具參數與結果 | 保留 JSON 原始型別，不把字串 `"true"`、`"false"`、`"null"` 猜成 bool／null。工具歷史的畸形 JSON 直接回 400，不以空參數偷偷修補 |
+| 工具參數與結果 | 參數保留 JSON 原始型別，畸形參數 JSON 回 400。工具結果是原始文字，包含看似 JSON 的內容、空白、重複鍵與 `true`／`null`／`1e999` 都以 `functionResponse.response.result` 字串傳遞，不再猜測解析；這與 Chat 舊有 JSON 結果解析行為不同 |
 | custom tools | 以上游接受一個 `input` 字串的函數承載，再回傳原字串；不再將特定字串變成另一段 JSON。grammar 不強制執行，會明確回報 |
 | Claude thinking 與多工具 | 共用路徑保留所有工具宣告、真正的思考／簽名與工具歷史，不再只傳第一個工具、不再虛構思考塊。Responses 可利用認證加密狀態回放原文 |
 | Gemini 簽名 | 已簽名的 reasoning 可用 `agy2.` 狀態回放；function-call 簽名以受保護的 call_id 承載，後續恢復原始上游 ID、名稱與簽名。一般文字 part 的簽名仍缺少通用 Responses 回放位置，會回報 `upstream.text_signature(not_replayable)` |
-| SSE | 有 created／in_progress、output items、delta、completed／incomplete／failed 與 sequence_number；支援 UTF-8 分片。畸形資料會失敗，不會在後續 STOP 時偽裝成功，也不會繼續交付其後的工具事件 |
+| SSE | 有 created／in_progress、output items、delta、completed／incomplete／failed 與 sequence_number；支援 UTF-8 分片。畸形資料、重複工具 ID、finish 後的新內容及 DONE 後的資料會失敗，不會偽裝成功或交付其後工具；允許獨立的晚到 usage 與相同 finish 控制事件 |
 | 串流中斷與取消 | 已交付內容後不重新發出整個上游請求。失敗會終止為 failed；客戶端取消／關閉時釋放上游 iterator。尚未交付內容的重試仍受伺服器重試設定控制 |
 | 抗截斷變體 | 只在串流啟用有界續傳。Claude 以 `AUTO` 配合提示詞引導合成 `emit_answer`，不更換模型或關閉 thinking，也不保證必定呼叫合成工具；覆寫明確 `tool_choice` 限制時回報 `tool_choice(anti_truncation_auto)`。非抗截斷模式維持原工具選擇，供應商不支援時明確拒絕 |
 | token 上限 | 尊重較小的請求值，最高為 64000。超過上限時回應 echo 有效的 64000，並明確回報 cap |

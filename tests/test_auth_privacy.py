@@ -10,6 +10,36 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 
 
+@pytest.mark.parametrize("supplied,expected,status", [
+    ("synthetic-面板密碼", "synthetic-面板密碼", 200),
+    ("synthetic-錯誤密碼", "synthetic-面板密碼", 401),
+    ("synthetic-面板密碼", "synthetic-ascii-password", 401),
+    ("synthetic-\ud800", "synthetic-ascii-password", 401),
+])
+@pytest.mark.asyncio
+async def test_panel_login_handles_unicode_passwords(monkeypatch, supplied, expected, status):
+    import httpx
+    from fastapi import FastAPI
+    from src import auth, utils
+    from src.panel import auth as panel_auth
+
+    monkeypatch.setattr(auth, "get_panel_password", AsyncMock(return_value=expected))
+    monkeypatch.setattr(panel_auth, "get_panel_password", AsyncMock(return_value=expected))
+    app = FastAPI()
+    app.include_router(panel_auth.router)
+    import json
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/auth/login", content=json.dumps({"password": supplied}),
+                                     headers={"Content-Type": "application/json"})
+    assert response.status_code == status
+    if status == 200:
+        token = response.json()["token"]
+        assert token != supplied
+        claims = jwt.decode(token, utils._panel_signing_key(expected),
+                            algorithms=["HS256"])
+        assert claims["sub"] == "panel"
+
+
 @pytest.mark.asyncio
 async def test_panel_session_is_not_the_password_and_expires(monkeypatch):
     from src import utils

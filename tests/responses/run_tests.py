@@ -76,6 +76,27 @@ def strip_volatile(p):
     return json.loads(json.dumps(p))
 
 
+def assert_tool_result_text_difference(chat, responses, call_id, text, chat_result):
+    """Validate one documented difference, then compare all other payload fields.
+
+    Responses preserves opaque tool-output text; the existing Chat adapter
+    parses JSON-looking results. Do not discard functionResponse fields or
+    normalize unasserted differences merely to make the equivalence test pass.
+    """
+    def result(payload):
+        matches = [part["functionResponse"]
+                   for content in payload["request"]["contents"]
+                   for part in content["parts"]
+                   if part.get("functionResponse", {}).get("id") == call_id]
+        assert len(matches) == 1, (call_id, matches)
+        return matches[0]
+
+    c, r = result(chat), result(responses)
+    assert c["response"] == chat_result, c
+    assert r["response"] == {"result": text}, r
+    c["response"] = {"result": text}
+
+
 TOOLS_R = [
     {"type": "function", "name": "calc", "description": "calc", "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}, "required": ["expr"]}},
     {"type": "function", "name": "get_weather", "description": "weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}},
@@ -139,6 +160,9 @@ def request_equivalence_pairs():
         c = strip_volatile(run(chat_payload(cb)))
         r, info, conv = run(resp_payload(rb))
         r = strip_volatile(r)
+        if label == "tools + parallel function calls + outputs (gemini)":
+            assert_tool_result_text_difference(c, r, "c1", "sunny", {"result": "sunny"})
+            assert_tool_result_text_difference(c, r, "c2", '{"t":3}', {"t": 3})
         assert c == r, f"{label}:\nchat={json.dumps(c)[:1500]}\nresp={json.dumps(r)[:1500]}"
         if "json_schema" in label:
             gc = r["request"]["generationConfig"]
@@ -163,6 +187,7 @@ def request_equivalence_claude_tools_documented_diff():
     # Shared normalization now preserves all tools and keeps thinking with tools.
     assert [d["name"] for t in c["request"]["tools"] for d in t["functionDeclarations"]] == ["calc", "get_weather"]
     assert r["request"]["generationConfig"]["thinkingConfig"] == {"includeThoughts": True}
+    assert_tool_result_text_difference(c, r, "toolu_1", "2", {"result": 2})
     assert c == r, f"\nchat={json.dumps(c)[:2000]}\nresp={json.dumps(r)[:2000]}"
 
 

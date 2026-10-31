@@ -671,4 +671,9 @@ def get_auth_status(project_id: str) -> Dict[str, Any]:
 async def verify_password(password: str) -> bool:
     """验证密码（面板登录使用）"""
     correct_password = await get_panel_password()
-    return bool(correct_password) and hmac.compare_digest(password, correct_password)
+    if not correct_password:
+        return False
+    try:
+        return hmac.compare_digest(password.encode("utf-8"), correct_password.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False

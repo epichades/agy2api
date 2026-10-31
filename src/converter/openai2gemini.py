@@ -25,12 +25,12 @@ from src.converter.utils import merge_system_messages
 
 from log import log
 
-#: 流式响应里每个 response_id 已分配到的工具调用序号。
+#: 流式响应里每个 response_id、candidate index 已分配到的工具调用序号。
 #: Gemini 的并行 functionCall 是「一个 chunk 一个 part」，若用 chunk 内 parts
 #: 下标当 OpenAI 的 tool_calls[].index，每个调用都会拿到 0；而按 OpenAI 流式规范
 #: 归并分片的客户端会把它们并进同一个 slot，arguments 拼成 `{"a":1}{"b":2}` 这种
 #: 非法 JSON。这里改按流内递增序号分配。
-_STREAM_TOOL_INDEX: "OrderedDict[str, int]" = OrderedDict()
+_STREAM_TOOL_INDEX: "OrderedDict[str, Dict[int, int]]" = OrderedDict()
 
 #: 上限：流被中途放弃（客户端断开、没有带 finishReason 的收尾块）时不会回收，
 #: 用 LRU 淘汰兜底，避免长期运行的实例无界增长。
@@ -42,10 +42,13 @@ def release_openai_stream_state(response_id: str) -> None:
     _STREAM_TOOL_INDEX.pop(response_id, None)
 
 
-def _next_stream_tool_call_indices(response_id: str, count: int) -> List[int]:
-    """为本 chunk 内的 count 个工具调用分配连续的流内序号。"""
-    base = _STREAM_TOOL_INDEX.get(response_id, 0)
-    _STREAM_TOOL_INDEX[response_id] = base + count
+def _next_stream_tool_call_indices(
+    response_id: str, count: int, candidate_index: int = 0,
+) -> List[int]:
+    """Allocate tool-call indices within one choice, independently of its peers."""
+    candidates = _STREAM_TOOL_INDEX.setdefault(response_id, {})
+    base = candidates.get(candidate_index, 0)
+    candidates[candidate_index] = base + count
     _STREAM_TOOL_INDEX.move_to_end(response_id)
     while len(_STREAM_TOOL_INDEX) > _STREAM_TOOL_INDEX_MAX_ENTRIES:
         _STREAM_TOOL_INDEX.popitem(last=False)
@@ -1263,11 +1266,16 @@ async def convert_openai_to_gemini_request(openai_request: Dict[str, Any]) -> Di
             elif not isinstance(content, str):
                 raise ValueError("Tool message content must be text or text parts")
 
-            # 解析响应数据
-            try:
-                response_data = json.loads(content)
-            except json.JSONDecodeError:
+            # Responses tool outputs are opaque strings, just like their
+            # function arguments: parsing JSON-looking text would discard
+            # whitespace/duplicate keys or turn text such as 1e999 into infinity.
+            if openai_request.get("_preserve_tool_arguments"):
                 response_data = {"result": content}
+            else:
+                try:
+                    response_data = json.loads(content)
+                except json.JSONDecodeError:
+                    response_data = {"result": content}
 
             # 确保 response_data 是字典类型（Gemini API 要求 response 必须是对象）
             if not isinstance(response_data, dict):
@@ -1687,6 +1695,7 @@ def convert_gemini_to_openai_stream(
     choices = []
 
     for candidate in gemini_response.get("candidates", []):
+        candidate_index = candidate.get("index", 0)
         role = candidate.get("content", {}).get("role", "assistant")
 
         # 将Gemini角色映射回OpenAI角色
@@ -1703,7 +1712,7 @@ def convert_gemini_to_openai_stream(
         # 对并行调用恒为 0。改用流内递增序号，客户端才能把它们归并成独立调用。
         if tool_calls:
             for tool_call, stream_index in zip(
-                tool_calls, _next_stream_tool_call_indices(response_id, len(tool_calls))
+                tool_calls, _next_stream_tool_call_indices(response_id, len(tool_calls), candidate_index)
             ):
                 tool_call["index"] = stream_index
 
@@ -1787,20 +1796,23 @@ def convert_gemini_to_openai_stream(
         # 只有在正常停止（STOP）且有工具调用时才设为 tool_calls
         # 避免在 SAFETY、MAX_TOKENS 等情况下仍然返回 tool_calls 导致循环
         # 注意: 流式响应中 tool_calls 通常在前序 chunk，收尾 chunk 的 tool_calls 为空，
-        # 需检查当前流 (response_id) 之前是否分配过工具调用序号 (_STREAM_TOOL_INDEX > 0)。
-        had_tools = bool(tool_calls or _STREAM_TOOL_INDEX.get(response_id, 0) > 0)
+        # Only this candidate's earlier tool calls affect its finish reason.
+        candidate_state = _STREAM_TOOL_INDEX.get(response_id, {})
+        had_tools = bool(tool_calls or candidate_state.get(candidate_index, 0) > 0)
         if had_tools and gemini_finish_reason == "STOP":
             finish_reason = "tool_calls"
 
         choices.append({
-            "index": candidate.get("index", 0),
+            "index": candidate_index,
             "delta": delta,
             "finish_reason": finish_reason,
         })
-
-    # 流已收尾，回收该 response_id 占用的工具调用序号
-    if any(choice.get("finish_reason") for choice in choices):
-        _STREAM_TOOL_INDEX.pop(response_id, None)
+        if finish_reason:
+            # Another candidate may still be generating tools after this one
+            # stops. Do not reset its numbering or forget its tool history.
+            candidate_state.pop(candidate_index, None)
+            if not candidate_state:
+                _STREAM_TOOL_INDEX.pop(response_id, None)
 
     # 转换 usageMetadata (只在流结束时存在)
     usage = _convert_usage_metadata(gemini_response.get("usageMetadata"))

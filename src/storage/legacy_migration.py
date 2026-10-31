@@ -3,7 +3,7 @@
 
 上游在检测到旧结构时直接 DROP TABLE（账号全部丢失）。本地改为:
 1. 旧表 RENAME 为 antigravity_credentials_legacy_<ts>（保留原始数据，不删除）
-2. 删除旧表上与新 ORM 同名的索引（索引名全局唯一，否则 create_all 冲突；索引不含数据）
+2. 为新 ORM 释放旧索引名；PostgreSQL 只改名，保留 UNIQUE 约束的依赖
 3. 新表建好后，按 user_email 把账号逐行迁移到新表（token/refresh_token/project_id/状态）
 """
 
@@ -34,7 +34,16 @@ def rename_legacy_table(sync_conn) -> Optional[str]:
         name = idx.get("name")
         if name and not name.startswith("sqlite_"):
             quoted_name = sync_conn.dialect.identifier_preparer.quote(name)
-            sync_conn.execute(text(f'DROP INDEX IF EXISTS {quoted_name}'))
+            if sync_conn.dialect.name == "postgresql":
+                # PostgreSQL reflects UNIQUE-constraint backing indexes too.
+                # DROP INDEX rejects those dependencies. Renaming all reflected
+                # indexes keeps the old table intact and frees explicit names
+                # such as idx_ag_disabled for the replacement table.
+                suffix = hashlib.sha256(f"{legacy}:{name}".encode()).hexdigest()[:24]
+                replacement = f"agy_legacy_{suffix}"
+                sync_conn.execute(text(f"ALTER INDEX {quoted_name} RENAME TO {replacement}"))
+            else:
+                sync_conn.execute(text(f'DROP INDEX IF EXISTS {quoted_name}'))
     log.warning(f"[MIGRATE] 旧版凭证表已改名保留为 {legacy}（不删除），稍后迁移到新表")
     return legacy
 

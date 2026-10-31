@@ -671,6 +671,12 @@ class AntiTruncationStreamProcessor:
                         synthetic_content, chunk_has_synthetic = (
                             extract_synthetic_content_from_response(data)
                         )
+                        # A single frame may contain both the helper and a real
+                        # tool. The helper conversion retains real calls, so the
+                        # no-replay boundary applies before either branch emits.
+                        chunk_has_real_tool = _chunk_has_real_function_call(data)
+                        if chunk_has_real_tool:
+                            real_tool_forwarded = True
 
                         if chunk_has_synthetic:
                             found_synthetic = True
@@ -696,10 +702,13 @@ class AntiTruncationStreamProcessor:
                             # 收集内容用于续传
                             self._append_content(synthetic_content)
 
-                            # 构建 chunk：截断原因（MAX_TOKENS）剥离后透传——
-                            # 客户端见到 MAX_TOKENS 会判定流被截断而提前终止，
-                            # 是否截断续传由网关决定，收尾统一补发 STOP
-                            is_truncated = chunk_finish in TRUNCATION_FINISH_REASONS
+                            # Only withhold truncation while continuation is
+                            # safe. Once any real tool is delivered, preserve
+                            # the upstream finish reason, including MAX_TOKENS.
+                            is_truncated = (
+                                chunk_finish in TRUNCATION_FINISH_REASONS
+                                and not real_tool_forwarded
+                            )
                             if is_truncated:
                                 stripped_data = self._strip_finish_reason(data)
                                 modified_data = build_text_chunk_from_synthetic(
@@ -720,9 +729,8 @@ class AntiTruncationStreamProcessor:
                                 last_finish_reason = chunk_finish
                                 finish_reason_forwarded = True
 
-                        elif _chunk_has_real_function_call(data):
+                        elif chunk_has_real_tool:
                             # 真实工具调用已交付，不能再通过续传请求重新生成它。
-                            real_tool_forwarded = True
                             # 真实工具调用，原样透传
                             chunk_finish = self._get_finish_reason(data)
                             if chunk_finish:

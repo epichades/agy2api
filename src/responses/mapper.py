@@ -110,6 +110,8 @@ class ResponsesMapper:
         self._line_buffer = ""
         self._utf8 = codecs.getincrementaldecoder("utf-8")()
         self._event_data: List[str] = []
+        self._upstream_done = False
+        self._seen_tool_ids: set[str] = set()
         self.stats = {"reasoning": 0, "reasoning_signed": 0, "message": 0, "function_call": 0, "custom_tool_call": 0}
 
     # ------------------------------------------------------------ events
@@ -266,6 +268,10 @@ class ResponsesMapper:
         if not isinstance(call_id, str):
             self.fail("Malformed upstream function-call identifier")
             return evs
+        if call_id in self._seen_tool_ids:
+            self.fail("Upstream reused a function-call identifier")
+            return evs
+        self._seen_tool_ids.add(call_id)
         if signature and signature != SKIP_THOUGHT_SIGNATURE_VALIDATOR:
             try:
                 state = enc.encode(self.conv.real_model, self.account_ref(), signature, "",
@@ -380,6 +386,16 @@ class ResponsesMapper:
             if not isinstance(content, dict) or not isinstance(content.get("parts", []), list):
                 self.fail("Malformed upstream content parts")
                 return evs
+            if self.finish_reason is not None and content.get("parts"):
+                self.fail("Upstream returned content after finishReason")
+                return evs
+            finish = cand.get("finishReason")
+            if finish is not None and (
+                not isinstance(finish, str) or not finish
+                or self.finish_reason not in (None, finish)
+            ):
+                self.fail("Upstream returned an invalid or inconsistent finishReason")
+                return evs
             for part in content.get("parts", []):
                 if self.error:
                     return evs
@@ -424,8 +440,8 @@ class ResponsesMapper:
                         self.conv.note("upstream.text_signature(not_replayable)")
                     elif part:
                         self.fail("Unsupported upstream content part")
-            if cand.get("finishReason"):
-                self.finish_reason = cand["finishReason"]
+            if finish is not None:
+                self.finish_reason = finish
         if r.get("usageMetadata"):
             self.usage_metadata = r["usageMetadata"]
         return evs
@@ -438,6 +454,10 @@ class ResponsesMapper:
         if self.error:
             return []
         if payload == "[DONE]":
+            self._upstream_done = True
+            return []
+        if self._upstream_done:
+            self.fail("Upstream sent data after its end marker")
             return []
         try:
             data = json.loads(payload)
